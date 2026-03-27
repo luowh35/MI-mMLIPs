@@ -1,0 +1,51 @@
+{
+  "data": {
+    "train_files": [  // 训练集 extxyz 文件列表；可放 1 个或多个文件，按帧拼接为总训练池
+      "pw_Fe16.extxyz",  // 平面波 Fe16 数据
+      "lcao_Fe16.extxyz",  // LCAO Fe16 数据
+      "pw_Fe32.extxyz",  // 平面波 Fe32 数据
+      "lcao_Fe32.extxyz"  // LCAO Fe32 数据
+    ],
+    "val_files": [],  // 验证集 extxyz 文件列表；为空时将从 train_files 内按 val_ratio 随机切分
+    "val_ratio": 0.1,  // 当 val_files 为空时，随机划分出的验证集比例
+    "max_train_frames_per_file": null,  // 每个训练文件最多读取多少帧；null 表示读取该文件全部帧（正式训练建议改成 null）
+    "max_val_frames_per_file": null  // 每个验证文件最多读取多少帧；null 表示读取全部帧
+  },
+
+  "model": {
+    "cutoff": 4.5,  // 邻居截断半径（单位与坐标一致）；越大信息越多但计算越重
+    "num_radial": 6,  // 径向基函数个数 n；描述符维度与计算量随其增加
+    "l_max": 2,  // Legendre 角向最高阶 l；控制三体角分辨率
+    "include_imm": true,  // 是否包含 A^(imm) 通道，即 (m_i·m_j)(m_i·m_k) 的三体磁项
+    "hidden_dim": 128,  // 局域 MLP 隐层宽度
+    "depth": 3  // 局域 MLP 深度（线性层总数，>=2）
+  },
+
+  "training": {
+    "epochs": 10,  // 总训练轮数
+    "lr": 0.001,  // Adam 学习率
+    "weight_decay": 0.000001,  // Adam 权重衰减（L2 正则）
+    "seed": 42,  // 随机种子（影响数据切分、参数初始化、shuffle）
+    "batch_size": 1,  // 当前实现仅支持 1（单帧训练，兼容不同原子数）
+    "num_workers": 0,  // DataLoader 子进程数；CPU 读取瓶颈时可适当增加
+    "energy_per_atom": true  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
+  },
+
+  "loss": {
+    "use_mag_loss": true,  // 是否使用磁梯度监督项（需要 extxyz 中含 magnetic_force）
+    "w_energy": 1.0,  // 能量损失权重
+    "w_force": 20.0,  // 原子力损失权重
+    "w_mag": 1.0  // 磁梯度损失权重
+  },
+
+  "output": {
+    "output_dir": "runs/train_from_json",  // 训练输出目录（日志、checkpoint、解析后的配置）
+    "save_last": true,  // 是否保存最后一轮 checkpoint 到 last.pt
+    "save_best": true,  // 是否按验证损失保存最佳 checkpoint 到 best.pt
+    "save_every_epoch": false  // 是否每个 epoch 都额外保存一个 checkpoint（会占较多磁盘）
+  },
+
+  "runtime": {
+    "device": "cuda"  // 训练设备：\"cpu\" 或 \"cuda\"
+  }
+}
