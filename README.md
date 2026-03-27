@@ -1,5 +1,29 @@
 # spin-mlips (extxyz workflow)
 
+## 0) Install dependencies
+
+CPU:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+CUDA 12.4:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements-cu124.txt
+```
+
+Or use:
+
+```bash
+bash install_deps.sh cpu
+# or
+bash install_deps.sh cu124
+```
+
 
 ## 1) Train minimal invariant magnetic potential from extxyz
 
