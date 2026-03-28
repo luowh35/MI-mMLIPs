@@ -184,6 +184,22 @@ def build_datasets(cfg: Dict[str, Any]):
     return train_ds, val_ds
 
 
+def resolve_energy_center_per_atom(train_ds) -> float:
+    if len(train_ds) == 0:
+        raise ValueError("Training dataset is empty; cannot estimate energy center.")
+
+    sum_energy = 0.0
+    sum_atoms = 0
+    for i in range(len(train_ds)):
+        sample = train_ds[i]
+        sum_energy += float(sample["energy"])
+        sum_atoms += int(sample["pos"].shape[0])
+
+    if sum_atoms <= 0:
+        raise ValueError("Invalid atom count while estimating energy center.")
+    return sum_energy / float(sum_atoms)
+
+
 def compute_losses(
     batch: Dict[str, torch.Tensor],
     pred_energy: torch.Tensor,
@@ -198,13 +214,14 @@ def compute_losses(
     target_energy = batch["energy"].to(device=device, dtype=torch.float32)  # [B]
     target_forces = batch["forces_flat"].to(device=device, dtype=torch.float32)  # [N_total, 3]
     n_atoms = batch["n_atoms"].to(device=device, dtype=torch.float32)  # [B]
+    center_pa = float(train_cfg.get("energy_center_per_atom", 0.0))
 
     if train_cfg["energy_per_atom"]:
         pred_e = pred_energy / n_atoms
-        tgt_e = target_energy / n_atoms
+        tgt_e = target_energy / n_atoms - center_pa
     else:
         pred_e = pred_energy
-        tgt_e = target_energy
+        tgt_e = target_energy - center_pa * n_atoms
 
     loss_e = (pred_e - tgt_e).pow(2).mean()
     loss_f = (pred_forces - target_forces).pow(2).mean()
@@ -313,6 +330,11 @@ def main() -> None:
         print("[warn] CUDA requested but unavailable, using CPU.")
 
     train_ds, val_ds = build_datasets(cfg)
+    cfg["training"]["energy_center_per_atom"] = resolve_energy_center_per_atom(train_ds)
+    print(
+        "[info] energy center (per atom) estimated from training set: "
+        f"{cfg['training']['energy_center_per_atom']:.8f}"
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["training"]["batch_size"],
