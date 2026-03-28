@@ -54,11 +54,15 @@ def predict_batch(
     pos_flat = _to_device_tensor(batch["pos_flat"], device).detach().requires_grad_(True)
     mag_flat = _to_device_tensor(batch["mag_flat"], device).detach().requires_grad_(True)
     cell = _to_device_tensor(batch["cell"], device)
+    if "pbc" in batch:
+        pbc = batch["pbc"].to(device=device, dtype=torch.bool)
+    else:
+        pbc = torch.ones((cell.shape[0], 3), device=device, dtype=torch.bool)
     n_atoms = batch["n_atoms"].to(device)
     batch_idx = batch["batch_idx"].to(device)
     B = n_atoms.shape[0]
 
-    descriptors = descriptor_builder.forward_batch(pos_flat, mag_flat, cell, n_atoms)
+    descriptors = descriptor_builder.forward_batch(pos_flat, mag_flat, cell, n_atoms, pbc=pbc)
     e_i = model(descriptors)  # [N_total]
 
     # per-frame energies via scatter_add
@@ -100,6 +104,7 @@ def predict_energy_forces_maggrad(
         "pos_flat": sample["pos"],
         "mag_flat": sample["mag"],
         "cell": sample["cell"].unsqueeze(0),
+        "pbc": sample.get("pbc", torch.ones(3, dtype=torch.bool)).unsqueeze(0),
         "n_atoms": torch.tensor([sample["pos"].shape[0]], dtype=torch.long),
         "batch_idx": torch.zeros(sample["pos"].shape[0], dtype=torch.long),
     }
@@ -108,3 +113,76 @@ def predict_energy_forces_maggrad(
         create_graph=create_graph, need_mag_grad=need_mag_grad,
     )
     return energies[0], forces, mag_grad
+
+
+def score_magnetic_candidates(
+    model: nn.Module,
+    descriptor_builder: nn.Module,
+    pos: torch.Tensor,
+    cell: torch.Tensor,
+    mag_candidates: torch.Tensor,
+    device: torch.device,
+    pbc: torch.Tensor | None = None,
+    need_mag_grad: bool = False,
+    create_graph: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Score many magnetic states for one fixed structure.
+
+    Inputs:
+    - pos: [N, 3]
+    - cell: [3, 3]
+    - pbc: [3] or None
+    - mag_candidates: [K, N, 3]
+
+    Returns:
+    - energies: [K] (sum_i E_i per candidate)
+    - mag_grads: [K, N, 3] or None
+    """
+    if mag_candidates.ndim != 3:
+        raise ValueError("mag_candidates must have shape [K, N, 3].")
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError("pos must have shape [N, 3].")
+    if cell.shape != (3, 3):
+        raise ValueError("cell must have shape [3, 3].")
+    if mag_candidates.shape[1] != pos.shape[0] or mag_candidates.shape[2] != 3:
+        raise ValueError("mag_candidates shape must match fixed structure atom count [K, N, 3].")
+
+    pos = _to_device_tensor(pos, device)
+    cell = _to_device_tensor(cell, device)
+    if pbc is None:
+        pbc = torch.ones(3, device=device, dtype=torch.bool)
+    else:
+        pbc = pbc.to(device=device, dtype=torch.bool)
+    mag_candidates = _to_device_tensor(mag_candidates, device)
+
+    k = int(mag_candidates.shape[0])
+    n = int(pos.shape[0])
+
+    pos_flat = pos.unsqueeze(0).expand(k, n, 3).reshape(k * n, 3).detach()
+    mag_flat = mag_candidates.reshape(k * n, 3).detach().requires_grad_(need_mag_grad)
+    cell_batch = cell.unsqueeze(0).expand(k, 3, 3)
+    pbc_batch = pbc.unsqueeze(0).expand(k, 3)
+    n_atoms = torch.full((k,), n, device=device, dtype=torch.long)
+    batch_idx = torch.arange(k, device=device, dtype=torch.long).repeat_interleave(n)
+
+    descriptors = descriptor_builder.forward_batch(
+        pos_flat, mag_flat, cell_batch, n_atoms, pbc=pbc_batch
+    )
+    e_i = model(descriptors)
+
+    energies = torch.zeros(k, device=device, dtype=e_i.dtype)
+    energies.scatter_add_(0, batch_idx, e_i)
+
+    if not need_mag_grad:
+        return energies, None
+
+    total_energy = energies.sum()
+    mag_grad_flat = -torch.autograd.grad(
+        total_energy,
+        mag_flat,
+        create_graph=create_graph,
+        retain_graph=create_graph,
+    )[0]
+    mag_grads = mag_grad_flat.reshape(k, n, 3)
+    return energies, mag_grads

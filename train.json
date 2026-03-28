@@ -8,6 +8,9 @@
     ],
     "val_files": [],  // 验证集 extxyz 文件列表；为空时将从 train_files 内按 val_ratio 随机切分
     "val_ratio": 0.1,  // 当 val_files 为空时，随机划分出的验证集比例
+    "split_mode": "source_file",  // 切分模式：source_file / config_type / set / block / random
+    "split_group_key": "source_file",  // 分组键（source_file / config_type / set）；block 模式下表示轨迹来源键
+    "split_block_size": 50,  // block 模式下每个连续轨迹块包含的帧数
     "max_train_frames_per_file": null,  // 每个训练文件最多读取多少帧；null 表示读取该文件全部帧（正式训练建议改成 null）
     "max_val_frames_per_file": null  // 每个验证文件最多读取多少帧；null 表示读取全部帧
   },
@@ -16,7 +19,17 @@
     "cutoff": 4.5,  // 邻居截断半径（单位与坐标一致）；越大信息越多但计算越重
     "num_radial": 6,  // 径向基函数个数 n；描述符维度与计算量随其增加
     "l_max": 2,  // Legendre 角向最高阶 l；控制三体角分辨率
-    "include_imm": true,  // 是否包含 A^(imm) 通道，即 (m_i·m_j)(m_i·m_k) 的三体磁项
+    "rho_u_basis": "legendre",  // rho_u 基函数：power / legendre
+    "rho_u_degree": 4,  // rho_u 阶数；legendre 模式下对应 P1..P_degree
+    "u_norm_mode": "dataset",  // 模长归一化：fixed / dataset / dual
+    "mag_ref": 2.2,  // fixed 模式下的参考磁矩（用于 |m|^2 归一化）
+    "m_stat": null,  // dataset/dual 模式下可手动指定统计尺度；null 表示自动估计
+    "m_stat_mode": "mean",  // 自动估计方式：mean / median / quantile
+    "m_stat_quantile": 0.5,  // quantile 模式的分位点
+    "u_center": null,  // rho_u 中心化参数（null 表示自动用参考尺度）
+    "u_scale": null,  // rho_u 标准化参数（null 表示自动用参考尺度）
+    "include_s2": true,  // 是否包含 rho_{s^2} 通道：sum_j f(r_ij) (m_i·m_j)^2
+    "include_imm": false,  // 是否包含 A^(imm) 通道，即 (m_i·m_j)(m_i·m_k) 的三体磁项
     "hidden_dim": 128,  // 局域 MLP 隐层宽度
     "depth": 3  // 局域 MLP 深度（线性层总数，>=2）
   },

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import bisect
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -9,6 +8,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
+
+try:
+    from ase.io import iread
+except ImportError:  # pragma: no cover - dependency checked at runtime.
+    iread = None
 
 
 @dataclass
@@ -150,61 +154,50 @@ class DeepSpinDataset(Dataset):
 
 
 @dataclass
-class _ExtXYZFrame:
-    path: Path
-    offset: int
-    natoms: int
+class _AseFrame:
+    source_file: str
+    pos: np.ndarray
+    cell: np.ndarray
+    pbc: np.ndarray
+    mag: np.ndarray
+    energy: float
+    forces: np.ndarray
+    mag_grad: Optional[np.ndarray]
+    config_type: Optional[str]
+    set_name: Optional[str]
 
 
-_KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"]*\"|\S+)")
-
-
-def _parse_comment_kv(comment: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for m in _KV_RE.finditer(comment.strip()):
-        key = m.group(1)
-        val = m.group(2)
-        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-            val = val[1:-1]
-        out[key] = val
-    return out
-
-
-def _parse_properties(properties: str) -> List[Tuple[str, str, int]]:
-    items = properties.split(":")
-    if len(items) % 3 != 0:
-        raise ValueError(f"Invalid Properties field: {properties}")
-    parsed = []
-    for i in range(0, len(items), 3):
-        name = items[i]
-        kind = items[i + 1]
-        ncols = int(items[i + 2])
-        parsed.append((name, kind, ncols))
-    return parsed
-
-
-def _pick_key(keys: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
-    for c in candidates:
-        if c in keys:
-            return c
+def _pick_first_key(keys: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    for key in candidates:
+        if key in keys:
+            return key
     return None
+
+
+def _extract_vector_array(arr: np.ndarray, natoms: int, name: str) -> np.ndarray:
+    if arr.ndim == 2 and arr.shape == (natoms, 3):
+        return arr.astype(np.float32, copy=False)
+    if arr.ndim == 1 and arr.shape[0] == natoms:
+        out = np.zeros((natoms, 3), dtype=np.float32)
+        # Scalar local moment/gradient is mapped to z-component.
+        out[:, 2] = arr.astype(np.float32, copy=False)
+        return out
+    raise ValueError(f"Array '{name}' must have shape (N,3) or (N,), got {arr.shape}")
 
 
 class ExtXYZDataset(Dataset):
     """
-    Lazy frame dataset for extxyz trajectories.
+    ASE-based frame dataset for extxyz trajectories.
 
     Required fields:
-    - comment: `Lattice`, `Energy/energy`, `Properties`
-    - atomic properties include `pos`, `force`, `magnetic_moment` (or alias)
+    - atomic arrays include `forces`/`force` and magnetic moments (`magnetic_moment`/`spin`/`mag`).
+    - frame info includes energy (`Energy`/`energy`).
     """
 
-    POS_KEYS = ("pos", "position")
-    FORCE_KEYS = ("force", "forces")
-    MAG_KEYS = ("magnetic_moment", "spin", "mag")
+    FORCE_KEYS = ("forces", "force")
+    MAG_KEYS = ("magnetic_moment", "spin", "mag", "magmoms")
     MAG_GRAD_KEYS = ("magnetic_force", "mag_grad", "force_mag")
     ENERGY_KEYS = ("Energy", "energy")
-    LATTICE_KEYS = ("Lattice", "lattice")
     CONFIG_KEYS = ("Config_type", "config_type")
     SET_KEYS = ("set", "Set")
 
@@ -216,133 +209,113 @@ class ExtXYZDataset(Dataset):
     ) -> None:
         if not files:
             raise ValueError("No extxyz files provided.")
+        if iread is None:
+            raise ImportError(
+                "ASE is required for ExtXYZDataset. Install with `pip install ase`."
+            )
 
         self.files = [Path(f) for f in files]
         self.include_mag_grad = include_mag_grad
         self.max_frames_per_file = max_frames_per_file
-        self.frames: List[_ExtXYZFrame] = []
+        self.frames: List[_AseFrame] = []
 
         for path in self.files:
             if not path.exists():
                 raise FileNotFoundError(f"extxyz file not found: {path}")
-            self._index_file(path)
+            self._load_file(path)
 
         if not self.frames:
             raise ValueError("No frames indexed from extxyz files.")
 
-    def _index_file(self, path: Path) -> None:
+    def _load_file(self, path: Path) -> None:
         added = 0
-        with path.open("r", encoding="utf-8") as f:
-            while True:
-                frame_offset = f.tell()
-                nat_line = f.readline()
-                if not nat_line:
-                    break
-                nat_line = nat_line.strip()
-                if not nat_line:
-                    continue
-                natoms = int(nat_line)
+        for atoms in iread(str(path), index=":"):
+            natoms = len(atoms)
+            info_keys = list(atoms.info.keys())
+            array_keys = list(atoms.arrays.keys())
 
-                comment = f.readline()
-                if not comment:
-                    raise ValueError(f"Incomplete frame in {path}")
+            force_key = _pick_first_key(array_keys, self.FORCE_KEYS)
+            mag_key = _pick_first_key(array_keys, self.MAG_KEYS)
+            mag_grad_key = _pick_first_key(array_keys, self.MAG_GRAD_KEYS)
+            energy_key = _pick_first_key(info_keys, self.ENERGY_KEYS)
 
-                for _ in range(natoms):
-                    atom_line = f.readline()
-                    if not atom_line:
-                        raise ValueError(f"Incomplete atom block in {path}")
+            if force_key is None and (atoms.calc is None or "forces" not in atoms.calc.results):
+                raise ValueError(f"Required field missing in {path}: forces.")
+            if mag_key is None:
+                init_mag = np.asarray(atoms.get_initial_magnetic_moments())
+                if init_mag.ndim != 1 or init_mag.shape[0] != natoms:
+                    raise ValueError(f"Required field missing in {path}: magnetic moments.")
+            if energy_key is None and (atoms.calc is None or "energy" not in atoms.calc.results):
+                raise ValueError(f"Required field missing in {path}: energy.")
 
-                self.frames.append(_ExtXYZFrame(path=path, offset=frame_offset, natoms=natoms))
-                added += 1
-                if self.max_frames_per_file is not None and added >= self.max_frames_per_file:
-                    break
+            pos = np.asarray(atoms.get_positions(), dtype=np.float32)
+            cell = np.asarray(atoms.cell.array, dtype=np.float32)
+            pbc = np.asarray(atoms.pbc, dtype=np.bool_)
+            if force_key is not None:
+                forces = _extract_vector_array(np.asarray(atoms.arrays[force_key]), natoms, force_key)
+            else:
+                forces = _extract_vector_array(np.asarray(atoms.get_forces()), natoms, "forces")
+            if mag_key is not None:
+                mag = _extract_vector_array(np.asarray(atoms.arrays[mag_key]), natoms, mag_key)
+            else:
+                mag = _extract_vector_array(
+                    np.asarray(atoms.get_initial_magnetic_moments()), natoms, "magmoms"
+                )
+            if energy_key is not None:
+                energy = float(atoms.info[energy_key])
+            else:
+                energy = float(atoms.get_potential_energy())
+
+            mag_grad = None
+            if self.include_mag_grad and mag_grad_key is not None:
+                mag_grad = _extract_vector_array(
+                    np.asarray(atoms.arrays[mag_grad_key]), natoms, mag_grad_key
+                )
+
+            cfg_key = _pick_first_key(info_keys, self.CONFIG_KEYS)
+            set_key = _pick_first_key(info_keys, self.SET_KEYS)
+            config_type = str(atoms.info[cfg_key]) if cfg_key is not None else None
+            set_name = str(atoms.info[set_key]) if set_key is not None else None
+
+            self.frames.append(
+                _AseFrame(
+                    source_file=str(path),
+                    pos=pos,
+                    cell=cell,
+                    pbc=pbc,
+                    mag=mag,
+                    energy=energy,
+                    forces=forces,
+                    mag_grad=mag_grad,
+                    config_type=config_type,
+                    set_name=set_name,
+                )
+            )
+            added += 1
+            if self.max_frames_per_file is not None and added >= self.max_frames_per_file:
+                break
 
     def __len__(self) -> int:
         return len(self.frames)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str]:
         frame = self.frames[index]
-        with frame.path.open("r", encoding="utf-8") as f:
-            f.seek(frame.offset)
-            natoms = int(f.readline().strip())
-            comment = f.readline().strip()
-            meta = _parse_comment_kv(comment)
-
-            if "Properties" not in meta:
-                raise ValueError(f"Properties not found in frame comment: {frame.path}")
-            prop_defs = _parse_properties(meta["Properties"])
-
-            offsets: Dict[str, Tuple[int, int]] = {}
-            start = 0
-            for name, _kind, ncols in prop_defs:
-                offsets[name] = (start, start + ncols)
-                start += ncols
-
-            pos_key = _pick_key(list(offsets.keys()), self.POS_KEYS)
-            force_key = _pick_key(list(offsets.keys()), self.FORCE_KEYS)
-            mag_key = _pick_key(list(offsets.keys()), self.MAG_KEYS)
-            mag_grad_key = _pick_key(list(offsets.keys()), self.MAG_GRAD_KEYS)
-
-            if pos_key is None or force_key is None or mag_key is None:
-                raise ValueError(
-                    f"Required properties missing in frame: pos={pos_key}, force={force_key}, mag={mag_key}"
-                )
-
-            pos = np.zeros((natoms, 3), dtype=np.float32)
-            forces = np.zeros((natoms, 3), dtype=np.float32)
-            mag = np.zeros((natoms, 3), dtype=np.float32)
-            mag_grad = np.zeros((natoms, 3), dtype=np.float32) if mag_grad_key else None
-
-            for i in range(natoms):
-                toks = f.readline().split()
-                if len(toks) < start:
-                    raise ValueError(f"Malformed atom line in {frame.path}")
-
-                p0, p1 = offsets[pos_key]
-                f0, f1 = offsets[force_key]
-                m0, m1 = offsets[mag_key]
-                pos[i] = np.asarray(toks[p0:p1], dtype=np.float32)
-                forces[i] = np.asarray(toks[f0:f1], dtype=np.float32)
-                mag[i] = np.asarray(toks[m0:m1], dtype=np.float32)
-
-                if mag_grad_key and mag_grad is not None:
-                    g0, g1 = offsets[mag_grad_key]
-                    mag_grad[i] = np.asarray(toks[g0:g1], dtype=np.float32)
-
-            energy_key = _pick_key(list(meta.keys()), self.ENERGY_KEYS)
-            if energy_key is None:
-                raise ValueError(f"Energy field missing in frame comment: {frame.path}")
-            energy = float(meta[energy_key])
-
-            lattice_key = _pick_key(list(meta.keys()), self.LATTICE_KEYS)
-            if lattice_key is None:
-                raise ValueError(f"Lattice field missing in frame comment: {frame.path}")
-            lattice_values = np.fromstring(meta[lattice_key], sep=" ", dtype=np.float32)
-            if lattice_values.size != 9:
-                raise ValueError(f"Lattice must have 9 values, got {lattice_values.size} in {frame.path}")
-            cell = lattice_values.reshape(3, 3)
-
-            sample: Dict[str, torch.Tensor | str] = {
-                "pos": torch.from_numpy(pos),
-                "cell": torch.from_numpy(cell),
-                "mag": torch.from_numpy(mag),
-                "energy": torch.tensor(energy, dtype=torch.float32),
-                "forces": torch.from_numpy(forces),
-                "source_file": str(frame.path),
-            }
-
-            cfg_key = _pick_key(list(meta.keys()), self.CONFIG_KEYS)
-            if cfg_key is not None:
-                sample["config_type"] = meta[cfg_key]
-
-            set_key = _pick_key(list(meta.keys()), self.SET_KEYS)
-            if set_key is not None:
-                sample["set"] = meta[set_key]
-
-            if self.include_mag_grad and mag_grad is not None:
-                sample["mag_grad"] = torch.from_numpy(mag_grad)
-
-            return sample
+        sample: Dict[str, torch.Tensor | str] = {
+            "pos": torch.from_numpy(frame.pos),
+            "cell": torch.from_numpy(frame.cell),
+            "pbc": torch.from_numpy(frame.pbc),
+            "mag": torch.from_numpy(frame.mag),
+            "energy": torch.tensor(frame.energy, dtype=torch.float32),
+            "forces": torch.from_numpy(frame.forces),
+            "source_file": frame.source_file,
+        }
+        if frame.config_type is not None:
+            sample["config_type"] = frame.config_type
+        if frame.set_name is not None:
+            sample["set"] = frame.set_name
+        if self.include_mag_grad and frame.mag_grad is not None:
+            sample["mag_grad"] = torch.from_numpy(frame.mag_grad)
+        return sample
 
 
 def split_train_val(
@@ -373,6 +346,136 @@ def split_train_val(
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
+def _split_group_map(
+    group_map: Dict[str, List[int]],
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
+    if not group_map:
+        raise ValueError("No groups found for split.")
+    if len(group_map) < 2:
+        raise ValueError(
+            "Need at least 2 groups for grouped split. "
+            "Use random split, block split, or provide explicit val files."
+        )
+
+    rng = np.random.default_rng(seed)
+    keys = list(group_map.keys())
+    rng.shuffle(keys)
+
+    n_total = sum(len(v) for v in group_map.values())
+    target_val = max(1, int(n_total * val_ratio))
+
+    val_groups: List[str] = []
+    train_groups: List[str] = []
+    val_count = 0
+
+    for idx_key, key in enumerate(keys):
+        n_remaining_groups = len(keys) - idx_key - 1
+        group_size = len(group_map[key])
+        can_add_to_val = val_count < target_val and n_remaining_groups > 0
+        if can_add_to_val:
+            val_groups.append(key)
+            val_count += group_size
+        else:
+            train_groups.append(key)
+
+    if not val_groups and train_groups:
+        val_groups.append(train_groups.pop())
+    if not train_groups and val_groups:
+        train_groups.append(val_groups.pop())
+
+    if not train_groups or not val_groups:
+        raise ValueError("Grouped split failed to produce non-empty train/val sets.")
+
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+    for key in train_groups:
+        train_idx.extend(group_map[key])
+    for key in val_groups:
+        val_idx.extend(group_map[key])
+
+    return train_idx, val_idx
+
+
+def split_train_val_grouped(
+    dataset: Dataset,
+    *,
+    group_key: str = "source_file",
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    max_samples: Optional[int] = None,
+) -> Tuple[Subset, Subset]:
+    """Split dataset by group key to avoid source leakage between train and val."""
+    n_total = len(dataset)
+    if n_total < 2:
+        raise ValueError("Need at least 2 samples for train/val split.")
+
+    indices = np.arange(n_total)
+    if max_samples is not None and max_samples > 0:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+        indices = indices[: min(len(indices), max_samples)]
+
+    group_map: Dict[str, List[int]] = {}
+    for idx in indices.tolist():
+        sample = dataset[idx]
+        if group_key not in sample:
+            raise KeyError(
+                f"Group key '{group_key}' not found in sample. "
+                "Use random split or provide a valid key."
+            )
+        key = str(sample[group_key])
+        group_map.setdefault(key, []).append(idx)
+
+    train_idx, val_idx = _split_group_map(group_map, val_ratio=val_ratio, seed=seed)
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+def split_train_val_by_blocks(
+    dataset: Dataset,
+    *,
+    block_size: int = 50,
+    source_key: str = "source_file",
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    max_samples: Optional[int] = None,
+) -> Tuple[Subset, Subset]:
+    """Split by contiguous frame blocks inside each source trajectory."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive.")
+    n_total = len(dataset)
+    if n_total < 2:
+        raise ValueError("Need at least 2 samples for train/val split.")
+
+    indices = np.arange(n_total)
+    if max_samples is not None and max_samples > 0:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+        indices = np.sort(indices[: min(len(indices), max_samples)])
+
+    source_to_indices: Dict[str, List[int]] = {}
+    for idx in indices.tolist():
+        sample = dataset[idx]
+        if source_key not in sample:
+            raise KeyError(
+                f"Source key '{source_key}' not found in sample. "
+                "Use random/group split or provide a valid source key."
+            )
+        source_to_indices.setdefault(str(sample[source_key]), []).append(idx)
+
+    group_map: Dict[str, List[int]] = {}
+    for source, src_indices in source_to_indices.items():
+        src_indices.sort()
+        for start in range(0, len(src_indices), block_size):
+            block = src_indices[start : start + block_size]
+            block_id = start // block_size
+            group_map[f"{source}::block_{block_id}"] = block
+
+    train_idx, val_idx = _split_group_map(group_map, val_ratio=val_ratio, seed=seed)
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
 def collate_single(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     if len(batch) != 1:
         raise ValueError("Use batch_size=1 with this collate function.")
@@ -383,7 +486,7 @@ def collate_flat_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
     """Flat graph-style batching: concatenate atoms from all frames with a batch_idx."""
     B = len(batch)
     pos_list, mag_list, forces_list = [], [], []
-    cell_list, energy_list, n_atoms_list = [], [], []
+    cell_list, pbc_list, energy_list, n_atoms_list = [], [], [], []
     mag_grad_list = []
     has_mag_grad = "mag_grad" in batch[0]
 
@@ -394,6 +497,7 @@ def collate_flat_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
         mag_list.append(sample["mag"])
         forces_list.append(sample["forces"])
         cell_list.append(sample["cell"])
+        pbc_list.append(sample.get("pbc", torch.ones(3, dtype=torch.bool)))
         energy_list.append(sample["energy"])
         if has_mag_grad:
             mag_grad_list.append(sample["mag_grad"])
@@ -408,6 +512,7 @@ def collate_flat_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
         "mag_flat": torch.cat(mag_list, dim=0),
         "forces_flat": torch.cat(forces_list, dim=0),
         "cell": torch.stack(cell_list, dim=0),
+        "pbc": torch.stack([x.to(dtype=torch.bool) for x in pbc_list], dim=0),
         "energy": torch.stack(energy_list, dim=0),
         "n_atoms": n_atoms,
         "batch_idx": batch_idx,
