@@ -379,6 +379,44 @@ def collate_single(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
     return batch[0]
 
 
+def collate_flat_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Flat graph-style batching: concatenate atoms from all frames with a batch_idx."""
+    B = len(batch)
+    pos_list, mag_list, forces_list = [], [], []
+    cell_list, energy_list, n_atoms_list = [], [], []
+    mag_grad_list = []
+    has_mag_grad = "mag_grad" in batch[0]
+
+    for sample in batch:
+        n = sample["pos"].shape[0]
+        n_atoms_list.append(n)
+        pos_list.append(sample["pos"])
+        mag_list.append(sample["mag"])
+        forces_list.append(sample["forces"])
+        cell_list.append(sample["cell"])
+        energy_list.append(sample["energy"])
+        if has_mag_grad:
+            mag_grad_list.append(sample["mag_grad"])
+
+    n_atoms = torch.tensor(n_atoms_list, dtype=torch.long)
+    batch_idx = torch.cat(
+        [torch.full((n,), i, dtype=torch.long) for i, n in enumerate(n_atoms_list)]
+    )
+
+    out: Dict[str, torch.Tensor] = {
+        "pos_flat": torch.cat(pos_list, dim=0),
+        "mag_flat": torch.cat(mag_list, dim=0),
+        "forces_flat": torch.cat(forces_list, dim=0),
+        "cell": torch.stack(cell_list, dim=0),
+        "energy": torch.stack(energy_list, dim=0),
+        "n_atoms": n_atoms,
+        "batch_idx": batch_idx,
+    }
+    if has_mag_grad:
+        out["mag_grad_flat"] = torch.cat(mag_grad_list, dim=0)
+    return out
+
+
 def parse_csv_list(values: Optional[str]) -> Optional[List[str]]:
     if values is None:
         return None

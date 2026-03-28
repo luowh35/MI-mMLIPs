@@ -25,6 +25,7 @@ class InvariantDescriptorBuilder(nn.Module):
         l_max: int = 2,
         include_imm: bool = True,
         eps: float = 1e-8,
+        mag_ref: float = 2.2,
     ) -> None:
         super().__init__()
         if cutoff <= 0:
@@ -39,6 +40,8 @@ class InvariantDescriptorBuilder(nn.Module):
         self.l_max = int(l_max)
         self.include_imm = bool(include_imm)
         self.eps = float(eps)
+        self.mag_ref = float(mag_ref)
+        self._u_ref = mag_ref * mag_ref  # reference u for normalization
 
         centers = torch.linspace(0.0, self.cutoff, steps=self.num_radial)
         if self.num_radial > 1:
@@ -94,7 +97,12 @@ class InvariantDescriptorBuilder(nn.Module):
     def minimum_image(self, disp: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         inv_cell = torch.linalg.inv(cell)
         frac = disp @ inv_cell
-        frac = frac - torch.round(frac)
+        # Iterative rounding for robustness with skewed cells
+        for _ in range(3):
+            shift = torch.round(frac)
+            frac = frac - shift
+            if shift.abs().max() < 0.5:
+                break
         return frac @ cell
 
     def forward(self, pos: torch.Tensor, mag: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
@@ -115,7 +123,8 @@ class InvariantDescriptorBuilder(nn.Module):
             idx = torch.where(neighbor_mask[i])[0]
             m_i = mag[i]
             u_i = (m_i * m_i).sum()
-            rho_u = torch.stack([u_i, u_i * u_i, u_i * u_i * u_i], dim=0)
+            u_norm = u_i / self._u_ref
+            rho_u = torch.stack([u_norm, u_norm * u_norm, u_norm * u_norm * u_norm], dim=0)
 
             if idx.numel() == 0:
                 rho_r = zeros_r
@@ -149,7 +158,10 @@ class InvariantDescriptorBuilder(nn.Module):
 
                     f_j = f[j_local]
                     f_k = f[k_local]
-                    pair = f_j.unsqueeze(-1) * f_k.unsqueeze(1)
+                    # Symmetrize (n,m): accumulate both (j,k) and (k,j) contributions
+                    pair_jk = f_j.unsqueeze(-1) * f_k.unsqueeze(1)  # [P, N, N]
+                    pair_kj = f_k.unsqueeze(-1) * f_j.unsqueeze(1)  # [P, N, N]
+                    pair = pair_jk + pair_kj  # symmetric in (n, m)
                     geom_tensor = pair.unsqueeze(-1) * p_l.unsqueeze(1).unsqueeze(1)
 
                     a_rr = geom_tensor.sum(dim=0).reshape(-1)
@@ -179,3 +191,18 @@ class InvariantDescriptorBuilder(nn.Module):
             all_features.append(torch.cat(parts, dim=0))
 
         return torch.stack(all_features, dim=0)
+
+    def forward_batch(
+        self,
+        pos_flat: torch.Tensor,
+        mag_flat: torch.Tensor,
+        cell: torch.Tensor,
+        n_atoms: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batch-aware forward: split flat tensors per frame, compute descriptors, cat back."""
+        pos_splits = torch.split(pos_flat, n_atoms.tolist())
+        mag_splits = torch.split(mag_flat, n_atoms.tolist())
+        descs = []
+        for pos_i, mag_i, cell_i in zip(pos_splits, mag_splits, cell):
+            descs.append(self.forward(pos_i, mag_i, cell_i))
+        return torch.cat(descs, dim=0)

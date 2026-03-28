@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from spin_mlips.data import ExtXYZDataset, collate_single, split_train_val
+from spin_mlips.data import ExtXYZDataset, collate_flat_batch, split_train_val
 from spin_mlips.descriptors import InvariantDescriptorBuilder
-from spin_mlips.model import LocalInvariantPotential, predict_energy_forces_maggrad
+from spin_mlips.model import LocalInvariantPotential, predict_batch
 
 
 def set_seed(seed: int) -> None:
@@ -117,6 +117,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
             "num_radial": int(_must(model_cfg, "num_radial")),
             "l_max": int(_must(model_cfg, "l_max")),
             "include_imm": bool(model_cfg.get("include_imm", False)),
+            "mag_ref": float(model_cfg.get("mag_ref", 2.2)),
             "hidden_dim": int(_must(model_cfg, "hidden_dim")),
             "depth": int(_must(model_cfg, "depth")),
         },
@@ -146,10 +147,6 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         },
     }
 
-    if output["training"]["batch_size"] != 1:
-        raise ValueError(
-            "Current implementation only supports batch_size=1 (variable atom counts)."
-        )
     return output
 
 
@@ -189,7 +186,7 @@ def build_datasets(cfg: Dict[str, Any]):
 
 
 def compute_losses(
-    sample: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
     pred_energy: torch.Tensor,
     pred_forces: torch.Tensor,
     pred_mag_grad: torch.Tensor | None,
@@ -199,22 +196,22 @@ def compute_losses(
     loss_cfg = cfg["loss"]
     train_cfg = cfg["training"]
 
-    target_energy = sample["energy"].to(device=device, dtype=torch.float32)
-    target_forces = sample["forces"].to(device=device, dtype=torch.float32)
-    n_atoms = sample["pos"].shape[0]
+    target_energy = batch["energy"].to(device=device, dtype=torch.float32)  # [B]
+    target_forces = batch["forces_flat"].to(device=device, dtype=torch.float32)  # [N_total, 3]
+    n_atoms = batch["n_atoms"].to(device=device, dtype=torch.float32)  # [B]
 
     if train_cfg["energy_per_atom"]:
-        pred_e = pred_energy / float(n_atoms)
-        tgt_e = target_energy / float(n_atoms)
+        pred_e = pred_energy / n_atoms
+        tgt_e = target_energy / n_atoms
     else:
         pred_e = pred_energy
         tgt_e = target_energy
 
-    loss_e = (pred_e - tgt_e).pow(2)
+    loss_e = (pred_e - tgt_e).pow(2).mean()
     loss_f = (pred_forces - target_forces).pow(2).mean()
 
-    if loss_cfg["use_mag_loss"] and ("mag_grad" in sample) and (pred_mag_grad is not None):
-        target_mag = sample["mag_grad"].to(device=device, dtype=torch.float32)
+    if loss_cfg["use_mag_loss"] and ("mag_grad_flat" in batch) and (pred_mag_grad is not None):
+        target_mag = batch["mag_grad_flat"].to(device=device, dtype=torch.float32)
         loss_g = (pred_mag_grad - target_mag).pow(2).mean()
     else:
         loss_g = torch.tensor(0.0, device=device)
@@ -253,29 +250,35 @@ def run_epoch(
     sums = {"loss": 0.0, "loss_e": 0.0, "loss_f": 0.0, "loss_g": 0.0}
     n_batches = 0
 
-    for sample in loader:
-        need_mag_grad = cfg["loss"]["use_mag_loss"] and ("mag_grad" in sample)
+    for batch in loader:
+        need_mag_grad = cfg["loss"]["use_mag_loss"] and ("mag_grad_flat" in batch)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        with torch.set_grad_enabled(True):
-            pred_energy, pred_forces, pred_mag_grad = predict_energy_forces_maggrad(
-                model=model,
-                descriptor_builder=descriptor,
-                sample=sample,
-                device=device,
-                create_graph=is_train,
-                need_mag_grad=need_mag_grad,
-            )
-            loss, metrics = compute_losses(
-                sample=sample,
-                pred_energy=pred_energy,
-                pred_forces=pred_forces,
-                pred_mag_grad=pred_mag_grad,
-                device=device,
-                cfg=cfg,
-            )
+        pred_energy, pred_forces, pred_mag_grad = predict_batch(
+            model=model,
+            descriptor_builder=descriptor,
+            batch=batch,
+            device=device,
+            create_graph=is_train,
+            need_mag_grad=need_mag_grad,
+        )
+
+        if not is_train:
+            pred_energy = pred_energy.detach()
+            pred_forces = pred_forces.detach()
+            if pred_mag_grad is not None:
+                pred_mag_grad = pred_mag_grad.detach()
+
+        loss, metrics = compute_losses(
+            batch=batch,
+            pred_energy=pred_energy,
+            pred_forces=pred_forces,
+            pred_mag_grad=pred_mag_grad,
+            device=device,
+            cfg=cfg,
+        )
 
         if is_train:
             loss.backward()
@@ -316,14 +319,14 @@ def main() -> None:
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,
         num_workers=cfg["training"]["num_workers"],
-        collate_fn=collate_single,
+        collate_fn=collate_flat_batch,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=False,
         num_workers=cfg["training"]["num_workers"],
-        collate_fn=collate_single,
+        collate_fn=collate_flat_batch,
     )
 
     descriptor = InvariantDescriptorBuilder(
@@ -331,6 +334,7 @@ def main() -> None:
         num_radial=cfg["model"]["num_radial"],
         l_max=cfg["model"]["l_max"],
         include_imm=cfg["model"]["include_imm"],
+        mag_ref=cfg["model"]["mag_ref"],
     ).to(device)
     model = LocalInvariantPotential(
         in_dim=descriptor.descriptor_dim,
@@ -397,6 +401,7 @@ def main() -> None:
                     "num_radial": cfg["model"]["num_radial"],
                     "l_max": cfg["model"]["l_max"],
                     "include_imm": cfg["model"]["include_imm"],
+                    "mag_ref": cfg["model"]["mag_ref"],
                 },
                 "optimizer_state": optimizer.state_dict(),
                 "run_config": run_config,

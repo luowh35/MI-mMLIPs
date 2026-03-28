@@ -59,8 +59,9 @@ def main() -> None:
 
     for m in m_values:
         mag = unit * float(m)
-        desc = descriptor(pos, mag, cell)
-        energy = model(desc).item()
+        with torch.no_grad():
+            desc = descriptor(pos, mag, cell)
+            energy = model(desc).item()
         rows.append((float(m), float(energy)))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
