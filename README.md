@@ -34,6 +34,7 @@ Key updates in config:
 - descriptor controls (`rho_u_basis`, `rho_u_degree`, `include_s2`, `include_imm`)
 - ASE-based extxyz reading (cell/pbc/arrays/info)
 - lightweight custom neighbor list (`O(N^2) + MIC + half list`)
+- legacy DeepSpin npy dataset interface moved to `spin_mlips.legacy`
 
 ## 2) Scan fixed-structure E(m) curve
 

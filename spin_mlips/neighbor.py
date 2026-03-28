@@ -23,7 +23,15 @@ def minimum_image_displacement(
     else:
         pbc = pbc.to(device=disp.device, dtype=torch.bool)
 
-    inv_cell = torch.linalg.inv(cell)
+    if not bool(pbc.any().item()):
+        return disp
+
+    try:
+        inv_cell = torch.linalg.inv(cell)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Cell matrix is singular but PBC is enabled; cannot apply minimum-image convention."
+        ) from exc
     frac = disp @ inv_cell
     wrapped = frac.clone()
     for a in range(3):

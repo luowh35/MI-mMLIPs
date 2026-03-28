@@ -2,7 +2,6 @@
 
 from .ase_io import iter_atoms, load_atoms
 from .data import (
-    DeepSpinDataset,
     ExtXYZDataset,
     collate_flat_batch,
     split_train_val,
@@ -23,7 +22,6 @@ __all__ = [
     "iter_atoms",
     "build_neighbor_list",
     "minimum_image_displacement",
-    "DeepSpinDataset",
     "ExtXYZDataset",
     "InvariantDescriptorBuilder",
     "LocalInvariantPotential",
