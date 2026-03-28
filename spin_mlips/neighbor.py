@@ -9,6 +9,7 @@ def minimum_image_displacement(
     disp: torch.Tensor,
     cell: torch.Tensor,
     pbc: torch.Tensor | Sequence[bool],
+    inv_cell: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Apply minimum-image convention to displacement vectors.
@@ -26,17 +27,15 @@ def minimum_image_displacement(
     if not bool(pbc.any().item()):
         return disp
 
-    try:
-        inv_cell = torch.linalg.inv(cell)
-    except RuntimeError as exc:
-        raise ValueError(
-            "Cell matrix is singular but PBC is enabled; cannot apply minimum-image convention."
-        ) from exc
+    if inv_cell is None:
+        try:
+            inv_cell = torch.linalg.inv(cell)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Cell matrix is singular but PBC is enabled; cannot apply minimum-image convention."
+            ) from exc
     frac = disp @ inv_cell
-    wrapped = frac.clone()
-    for a in range(3):
-        if bool(pbc[a].item()):
-            wrapped[..., a] = wrapped[..., a] - torch.round(wrapped[..., a])
+    wrapped = frac - torch.round(frac) * pbc.to(dtype=frac.dtype)
     return wrapped @ cell
 
 
@@ -73,36 +72,47 @@ def build_neighbor_list(
         raise ValueError("pbc must have shape [3].")
 
     neighbors: List[List[int]] = [[] for _ in range(n_atoms)]
-    edge_i: List[int] = []
-    edge_j: List[int] = []
-    edge_vecs: List[torch.Tensor] = []
-    edge_dists: List[torch.Tensor] = []
-
-    for i in range(n_atoms - 1):
-        for j in range(i + 1, n_atoms):
-            disp = (pos[j] - pos[i]).unsqueeze(0)
-            rij = minimum_image_displacement(disp=disp, cell=cell, pbc=pbc_t).squeeze(0)
-            dist = torch.linalg.norm(rij)
-            if float(dist) >= cutoff:
-                continue
-
-            edge_i.append(i)
-            edge_j.append(j)
-            edge_vecs.append(rij)
-            edge_dists.append(dist)
-            neighbors[i].append(j)
-            neighbors[j].append(i)
-
-    if edge_vecs:
-        edge_index = torch.tensor([edge_i, edge_j], device=pos.device, dtype=torch.long)
-        edge_vec = torch.stack(edge_vecs, dim=0)
-        edge_dist = torch.stack(edge_dists, dim=0)
-        edge_unit = edge_vec / (edge_dist.unsqueeze(-1) + eps)
-    else:
+    if n_atoms < 2:
         edge_index = torch.empty((2, 0), device=pos.device, dtype=torch.long)
         edge_vec = pos.new_zeros((0, 3))
         edge_dist = pos.new_zeros((0,))
         edge_unit = pos.new_zeros((0, 3))
+        return {
+            "edge_index": edge_index,
+            "edge_vec": edge_vec,
+            "edge_dist": edge_dist,
+            "edge_unit": edge_unit,
+            "neighbors": neighbors,
+        }
+
+    pair_idx = torch.triu_indices(n_atoms, n_atoms, offset=1, device=pos.device)
+    disp = pos[pair_idx[1]] - pos[pair_idx[0]]
+
+    inv_cell = None
+    if bool(pbc_t.any().item()):
+        try:
+            inv_cell = torch.linalg.inv(cell)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Cell matrix is singular but PBC is enabled; cannot apply minimum-image convention."
+            ) from exc
+    rij = minimum_image_displacement(disp=disp, cell=cell, pbc=pbc_t, inv_cell=inv_cell)
+    dist = torch.linalg.norm(rij, dim=-1)
+    mask = dist < cutoff
+
+    edge_i = pair_idx[0][mask]
+    edge_j = pair_idx[1][mask]
+    edge_index = torch.stack([edge_i, edge_j], dim=0)
+    edge_vec = rij[mask]
+    edge_dist = dist[mask]
+    edge_unit = edge_vec / (edge_dist.unsqueeze(-1) + eps)
+
+    if edge_index.shape[1] > 0:
+        edge_i_list = edge_i.detach().cpu().tolist()
+        edge_j_list = edge_j.detach().cpu().tolist()
+        for i, j in zip(edge_i_list, edge_j_list):
+            neighbors[i].append(j)
+            neighbors[j].append(i)
 
     return {
         "edge_index": edge_index,

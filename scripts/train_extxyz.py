@@ -158,6 +158,13 @@ def load_config(config_path: Path) -> Dict[str, Any]:
             "seed": int(train_cfg.get("seed", 42)),
             "batch_size": int(train_cfg.get("batch_size", 1)),
             "num_workers": int(train_cfg.get("num_workers", 0)),
+            "pin_memory": bool(train_cfg.get("pin_memory", True)),
+            "persistent_workers": bool(train_cfg.get("persistent_workers", True)),
+            "prefetch_factor": (
+                int(train_cfg["prefetch_factor"])
+                if train_cfg.get("prefetch_factor") is not None
+                else None
+            ),
             "energy_per_atom": bool(train_cfg.get("energy_per_atom", True)),
         },
         "loss": {
@@ -346,7 +353,7 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     cfg: Dict[str, Any],
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     is_train = optimizer is not None
     if is_train:
         model.train()
@@ -365,13 +372,27 @@ def run_epoch(
         "loss_g_rmse": 0.0,
     }
     n_batches = 0
+    timing = {
+        "data_wait_s": 0.0,
+        "predict_total_s": 0.0,
+        "descriptor_s": 0.0,
+        "model_s": 0.0,
+        "grad_force_s": 0.0,
+        "grad_mag_s": 0.0,
+        "loss_s": 0.0,
+        "backward_step_s": 0.0,
+    }
 
+    iter_t0 = time.perf_counter()
     for batch in loader:
+        timing["data_wait_s"] += time.perf_counter() - iter_t0
         need_mag_grad = cfg["loss"]["use_mag_loss"] and ("mag_grad_flat" in batch)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
+        pred_t0 = time.perf_counter()
+        pred_profile: Dict[str, float] = {}
         pred_energy, pred_forces, pred_mag_grad = predict_batch(
             model=model,
             descriptor_builder=descriptor,
@@ -379,7 +400,13 @@ def run_epoch(
             device=device,
             create_graph=is_train,
             need_mag_grad=need_mag_grad,
+            profile=pred_profile,
         )
+        timing["predict_total_s"] += time.perf_counter() - pred_t0
+        timing["descriptor_s"] += pred_profile.get("descriptor_s", 0.0)
+        timing["model_s"] += pred_profile.get("model_s", 0.0)
+        timing["grad_force_s"] += pred_profile.get("grad_force_s", 0.0)
+        timing["grad_mag_s"] += pred_profile.get("grad_mag_s", 0.0)
 
         if not is_train:
             pred_energy = pred_energy.detach()
@@ -387,6 +414,7 @@ def run_epoch(
             if pred_mag_grad is not None:
                 pred_mag_grad = pred_mag_grad.detach()
 
+        loss_t0 = time.perf_counter()
         loss, metrics = compute_losses(
             batch=batch,
             pred_energy=pred_energy,
@@ -395,18 +423,30 @@ def run_epoch(
             device=device,
             cfg=cfg,
         )
+        timing["loss_s"] += time.perf_counter() - loss_t0
 
         if is_train:
+            bw_t0 = time.perf_counter()
             loss.backward()
             optimizer.step()
+            timing["backward_step_s"] += time.perf_counter() - bw_t0
 
         for k in sums:
             sums[k] += metrics[k]
         n_batches += 1
+        iter_t0 = time.perf_counter()
 
     if n_batches == 0:
-        return {k: float("nan") for k in sums}
-    return {k: sums[k] / n_batches for k in sums}
+        return (
+            {k: float("nan") for k in sums},
+            {k: float("nan") for k in timing},
+        )
+
+    timing["n_batches"] = float(n_batches)
+    return (
+        {k: sums[k] / n_batches for k in sums},
+        timing,
+    )
 
 
 def main() -> None:
@@ -451,20 +491,31 @@ def main() -> None:
         "[info] energy center (per atom) estimated from training set: "
         f"{cfg['training']['energy_center_per_atom']:.8f}"
     )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=True,
-        num_workers=cfg["training"]["num_workers"],
-        collate_fn=collate_flat_batch,
+    num_workers = int(cfg["training"]["num_workers"])
+    pin_memory = bool(cfg["training"].get("pin_memory", True)) and device.type == "cuda"
+    persistent_workers = bool(cfg["training"].get("persistent_workers", True)) and num_workers > 0
+    prefetch_factor = cfg["training"].get("prefetch_factor")
+    loader_common_kwargs: Dict[str, Any] = {
+        "batch_size": cfg["training"]["batch_size"],
+        "num_workers": num_workers,
+        "collate_fn": collate_flat_batch,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_common_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_common_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    print(
+        "[info] dataloader: "
+        f"batch_size={cfg['training']['batch_size']} "
+        f"num_workers={num_workers} "
+        f"pin_memory={pin_memory} "
+        f"persistent_workers={loader_common_kwargs.get('persistent_workers', False)} "
+        f"prefetch_factor={loader_common_kwargs.get('prefetch_factor', 'default')}"
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["training"]["num_workers"],
-        collate_fn=collate_flat_batch,
-    )
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_common_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_common_kwargs)
 
     descriptor = InvariantDescriptorBuilder(
         cutoff=cfg["model"]["cutoff"],
@@ -504,7 +555,7 @@ def main() -> None:
     with log_path.open("w", encoding="utf-8") as logf:
         for epoch in range(1, cfg["training"]["epochs"] + 1):
             t0 = time.time()
-            train_metrics = run_epoch(
+            train_metrics, train_timing = run_epoch(
                 loader=train_loader,
                 model=model,
                 descriptor=descriptor,
@@ -512,7 +563,7 @@ def main() -> None:
                 optimizer=optimizer,
                 cfg=cfg,
             )
-            val_metrics = run_epoch(
+            val_metrics, val_timing = run_epoch(
                 loader=val_loader,
                 model=model,
                 descriptor=descriptor,
@@ -526,6 +577,10 @@ def main() -> None:
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics,
+                "timing": {
+                    "train": train_timing,
+                    "val": val_timing,
+                },
                 "seconds": dt,
             }
             logf.write(json.dumps(row, ensure_ascii=True) + "\n")
@@ -579,7 +634,11 @@ def main() -> None:
                 f"val_e_rmse={val_metrics['loss_e_rmse']:.6f} "
                 f"val_f_rmse={val_metrics['loss_f_rmse']:.6f} "
                 f"val_g_rmse={val_metrics['loss_g_rmse']:.6f} "
-                f"time={dt:.2f}s"
+                f"time={dt:.2f}s "
+                f"train_data_wait={train_timing['data_wait_s']:.2f}s "
+                f"train_desc={train_timing['descriptor_s']:.2f}s "
+                f"train_model={train_timing['model_s']:.2f}s "
+                f"train_bwd={train_timing['backward_step_s']:.2f}s"
             )
 
     if cfg["output"]["save_best"]:

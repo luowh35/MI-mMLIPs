@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Dict, Tuple
 
 import torch
@@ -49,6 +50,7 @@ def predict_batch(
     device: torch.device,
     create_graph: bool = True,
     need_mag_grad: bool = True,
+    profile: Dict[str, float] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Predict energies, forces, mag_grad for a flat-batched dict."""
     pos_flat = _to_device_tensor(batch["pos_flat"], device).detach().requires_grad_(True)
@@ -62,29 +64,72 @@ def predict_batch(
     batch_idx = batch["batch_idx"].to(device)
     B = n_atoms.shape[0]
 
-    descriptors = descriptor_builder.forward_batch(pos_flat, mag_flat, cell, n_atoms, pbc=pbc)
+    desc_t0 = time.perf_counter()
+    desc_acc_before = profile.get("descriptor_s", 0.0) if profile is not None else 0.0
+    if profile is None:
+        descriptors = descriptor_builder.forward_batch(
+            pos_flat,
+            mag_flat,
+            cell,
+            n_atoms,
+            pbc=pbc,
+        )
+    else:
+        try:
+            descriptors = descriptor_builder.forward_batch(
+                pos_flat,
+                mag_flat,
+                cell,
+                n_atoms,
+                pbc=pbc,
+                profile=profile,
+            )
+        except TypeError:
+            descriptors = descriptor_builder.forward_batch(
+                pos_flat,
+                mag_flat,
+                cell,
+                n_atoms,
+                pbc=pbc,
+            )
+    if profile is not None:
+        # Prefer descriptor-side timing; fallback to outer timing for generic builders.
+        if profile.get("descriptor_s", 0.0) <= desc_acc_before:
+            profile["descriptor_s"] = profile.get("descriptor_s", 0.0) + (
+                time.perf_counter() - desc_t0
+            )
+
+    model_t0 = time.perf_counter()
     e_i = model(descriptors)  # [N_total]
 
     # per-frame energies via scatter_add
     energies = torch.zeros(B, device=device, dtype=e_i.dtype)
     energies.scatter_add_(0, batch_idx, e_i)
+    if profile is not None:
+        profile["model_s"] = profile.get("model_s", 0.0) + (time.perf_counter() - model_t0)
 
     # forces and mag_grad via autograd on the total energy
     total_energy = energies.sum()
+    force_t0 = time.perf_counter()
     forces = -torch.autograd.grad(
         total_energy,
         pos_flat,
         create_graph=create_graph,
         retain_graph=need_mag_grad or create_graph,
     )[0]
+    if profile is not None:
+        profile["grad_force_s"] = profile.get("grad_force_s", 0.0) + (time.perf_counter() - force_t0)
 
     if need_mag_grad:
+        mag_t0 = time.perf_counter()
         mag_grad = -torch.autograd.grad(
             total_energy,
             mag_flat,
             create_graph=create_graph,
             retain_graph=create_graph,
         )[0]
+        if profile is not None:
+            profile["grad_mag_s"] = profile.get("grad_mag_s", 0.0) + (time.perf_counter() - mag_t0)
     else:
         mag_grad = None
 

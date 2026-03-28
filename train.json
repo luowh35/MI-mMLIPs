@@ -21,8 +21,8 @@
     "l_max": 2,  // Legendre 角向最高阶 l；控制三体角分辨率
     "rho_u_basis": "legendre",  // rho_u 基函数：power / legendre
     "rho_u_degree": 4,  // rho_u 阶数；legendre 模式下对应 P1..P_degree
-    "u_norm_mode": "dataset",  // 模长归一化：fixed / dataset / dual
-    "mag_ref": 2.2,  // fixed 模式下的参考磁矩（用于 |m|^2 归一化）
+    "u_norm_mode": "dataset",  // 模长归一化：dataset / dual
+    "mag_ref": 2.2,  // 兜底参考磁矩（当 m_stat 为空时用于 |m|^2 归一化）
     "m_stat": null,  // dataset/dual 模式下可手动指定统计尺度；null 表示自动估计
     "m_stat_mode": "mean",  // 自动估计方式：mean / median / quantile
     "m_stat_quantile": 0.5,  // quantile 模式的分位点
@@ -39,8 +39,11 @@
     "lr": 0.001,  // Adam 学习率
     "weight_decay": 0.000001,  // Adam 权重衰减（L2 正则）
     "seed": 42,  // 随机种子（影响数据切分、参数初始化、shuffle）
-    "batch_size": 1,  // 旧版脚本仅支持 1；若使用支持 flat-batch 的新版脚本可适当调大（如 2/4）
-    "num_workers": 0,  // DataLoader 子进程数；CPU 读取瓶颈时可适当增加
+    "batch_size": 1,  // 若显存仍很低且 CPU 忙，可先固定小 batch，优先提速数据/descriptor 管线
+    "num_workers": 4,  // DataLoader 子进程数；建议 0->2->4 逐步测试吞吐
+    "pin_memory": true,  // CUDA 训练时建议开启，可减少 H2D 拷贝等待
+    "persistent_workers": true,  // num_workers>0 时保留 worker，减少每个 epoch 重启开销
+    "prefetch_factor": 2,  // 每个 worker 预取 batch 数；仅在 num_workers>0 时生效
     "energy_per_atom": true  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
   },
 

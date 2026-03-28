@@ -31,10 +31,16 @@ Training parameters are controlled by `train.json` (JSONC with `// ...` comments
 Key updates in config:
 - grouped split modes (`source_file` / `config_type` / `set` / `block` / `random`)
 - configurable magnetic normalization (`u_norm_mode`, `mag_ref`, `m_stat*`)
+  (`u_norm_mode` supports `dataset` / `dual`)
 - descriptor controls (`rho_u_basis`, `rho_u_degree`, `include_s2`, `include_imm`)
 - ASE-based extxyz reading (cell/pbc/arrays/info)
-- lightweight custom neighbor list (`O(N^2) + MIC + half list`)
+- lightweight custom neighbor list (`O(N^2)` tensorized pair build + MIC + half list)
+- DataLoader pipeline knobs (`num_workers`, `pin_memory`, `persistent_workers`, `prefetch_factor`)
+- per-epoch timing breakdown in logs (`data_wait`, `descriptor`, `model`, `autograd`)
 - legacy DeepSpin npy dataset interface moved to `spin_mlips.legacy`
+
+Training now prints timing terms such as `train_data_wait`, `train_desc`, `train_model`, `train_bwd`,
+and writes detailed timing dictionaries into `runs/.../metrics.jsonl`.
 
 ## 2) Scan fixed-structure E(m) curve
 

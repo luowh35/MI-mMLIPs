@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn as nn
 
@@ -29,7 +31,7 @@ class InvariantDescriptorBuilder(nn.Module):
         l_max: int = 2,
         rho_u_basis: str = "power",
         rho_u_degree: int = 3,
-        u_norm_mode: str = "fixed",
+        u_norm_mode: str = "dataset",
         mag_ref: float = MAG_REF,
         m_stat: float | None = None,
         u_center: float | None = None,
@@ -51,8 +53,8 @@ class InvariantDescriptorBuilder(nn.Module):
             raise ValueError("rho_u_basis must be one of: power, legendre.")
         if rho_u_degree <= 0:
             raise ValueError("rho_u_degree must be >= 1.")
-        if u_norm_mode not in {"fixed", "dataset", "dual"}:
-            raise ValueError("u_norm_mode must be one of: fixed, dataset, dual.")
+        if u_norm_mode not in {"dataset", "dual"}:
+            raise ValueError("u_norm_mode must be one of: dataset, dual.")
         if mag_ref <= 0:
             raise ValueError("mag_ref must be positive.")
         if m_stat is not None and m_stat <= 0:
@@ -144,9 +146,6 @@ class InvariantDescriptorBuilder(nn.Module):
         return base
 
     def _resolve_u_ref(self) -> float:
-        if self.u_norm_mode == "fixed":
-            return max(self.mag_ref * self.mag_ref, self.eps)
-
         if self.m_stat is not None:
             return max(self.m_stat * self.m_stat, self.eps)
         return max(self.mag_ref * self.mag_ref, self.eps)
@@ -199,6 +198,7 @@ class InvariantDescriptorBuilder(nn.Module):
         mag: torch.Tensor,
         cell: torch.Tensor,
         pbc: torch.Tensor | None = None,
+        profile: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Return:
@@ -215,6 +215,7 @@ class InvariantDescriptorBuilder(nn.Module):
         else:
             pbc = pbc.to(device=pos.device, dtype=torch.bool)
 
+        neighbor_t0 = time.perf_counter()
         nb = build_neighbor_list(
             pos=pos,
             cell=cell,
@@ -222,11 +223,16 @@ class InvariantDescriptorBuilder(nn.Module):
             cutoff=self.cutoff,
             eps=self.eps,
         )
+        if profile is not None:
+            profile["neighbor_s"] = (
+                profile.get("neighbor_s", 0.0) + (time.perf_counter() - neighbor_t0)
+            )
         neigh_idx = nb["neighbors"]
         edge_index = nb["edge_index"]
         edge_vec = nb["edge_vec"]
         edge_dist = nb["edge_dist"]
 
+        kernel_t0 = time.perf_counter()
         neigh_vec: list[list[torch.Tensor]] = [[] for _ in range(n_atoms)]
         neigh_len: list[list[torch.Tensor]] = [[] for _ in range(n_atoms)]
         for e in range(edge_index.shape[1]):
@@ -327,6 +333,11 @@ class InvariantDescriptorBuilder(nn.Module):
             all_geom.append(torch.cat([rho_r, a_rr], dim=0))
             all_mag.append(torch.cat(mag_parts, dim=0))
 
+        if profile is not None:
+            profile["descriptor_kernel_s"] = (
+                profile.get("descriptor_kernel_s", 0.0) + (time.perf_counter() - kernel_t0)
+            )
+
         return (
             torch.stack(all_desc, dim=0),
             torch.stack(all_geom, dim=0),
@@ -339,8 +350,15 @@ class InvariantDescriptorBuilder(nn.Module):
         mag: torch.Tensor,
         cell: torch.Tensor,
         pbc: torch.Tensor | None = None,
+        profile: dict[str, float] | None = None,
     ) -> torch.Tensor:
-        descriptor, _, _ = self.forward_with_blocks(pos=pos, mag=mag, cell=cell, pbc=pbc)
+        descriptor, _, _ = self.forward_with_blocks(
+            pos=pos,
+            mag=mag,
+            cell=cell,
+            pbc=pbc,
+            profile=profile,
+        )
         return descriptor
 
     def forward_batch(
@@ -350,6 +368,7 @@ class InvariantDescriptorBuilder(nn.Module):
         cell: torch.Tensor,
         n_atoms: torch.Tensor,
         pbc: torch.Tensor | None = None,
+        profile: dict[str, float] | None = None,
     ) -> torch.Tensor:
         """Batch-aware forward: split flat tensors per frame, compute descriptors, cat back."""
         pos_splits = torch.split(pos_flat, n_atoms.tolist())
@@ -358,7 +377,12 @@ class InvariantDescriptorBuilder(nn.Module):
             pbc = torch.ones((cell.shape[0], 3), device=cell.device, dtype=torch.bool)
         descs = []
         for pos_i, mag_i, cell_i, pbc_i in zip(pos_splits, mag_splits, cell, pbc):
-            descs.append(self.forward(pos_i, mag_i, cell_i, pbc=pbc_i))
+            frame_t0 = time.perf_counter()
+            descs.append(self.forward(pos_i, mag_i, cell_i, pbc=pbc_i, profile=profile))
+            if profile is not None:
+                profile["descriptor_s"] = (
+                    profile.get("descriptor_s", 0.0) + (time.perf_counter() - frame_t0)
+                )
         return torch.cat(descs, dim=0)
 
     def forward_batch_with_blocks(
@@ -368,6 +392,7 @@ class InvariantDescriptorBuilder(nn.Module):
         cell: torch.Tensor,
         n_atoms: torch.Tensor,
         pbc: torch.Tensor | None = None,
+        profile: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pos_splits = torch.split(pos_flat, n_atoms.tolist())
         mag_splits = torch.split(mag_flat, n_atoms.tolist())
@@ -377,7 +402,13 @@ class InvariantDescriptorBuilder(nn.Module):
         geoms = []
         mags = []
         for pos_i, mag_i, cell_i, pbc_i in zip(pos_splits, mag_splits, cell, pbc):
-            d_i, g_i, m_i = self.forward_with_blocks(pos=pos_i, mag=mag_i, cell=cell_i, pbc=pbc_i)
+            d_i, g_i, m_i = self.forward_with_blocks(
+                pos=pos_i,
+                mag=mag_i,
+                cell=cell_i,
+                pbc=pbc_i,
+                profile=profile,
+            )
             descs.append(d_i)
             geoms.append(g_i)
             mags.append(m_i)
