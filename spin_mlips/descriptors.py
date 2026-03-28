@@ -17,6 +17,7 @@ class InvariantDescriptorBuilder(nn.Module):
     - A_mm
     - A_imm (optional)
     """
+    MAG_REF = 2.2
 
     def __init__(
         self,
@@ -25,7 +26,6 @@ class InvariantDescriptorBuilder(nn.Module):
         l_max: int = 2,
         include_imm: bool = True,
         eps: float = 1e-8,
-        mag_ref: float = 2.2,
     ) -> None:
         super().__init__()
         if cutoff <= 0:
@@ -40,8 +40,7 @@ class InvariantDescriptorBuilder(nn.Module):
         self.l_max = int(l_max)
         self.include_imm = bool(include_imm)
         self.eps = float(eps)
-        self.mag_ref = float(mag_ref)
-        self._u_ref = mag_ref * mag_ref  # reference u for normalization
+        self._u_ref = self.MAG_REF * self.MAG_REF  # reference u for normalization
 
         centers = torch.linspace(0.0, self.cutoff, steps=self.num_radial)
         if self.num_radial > 1:

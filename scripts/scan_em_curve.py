@@ -35,7 +35,9 @@ def main() -> None:
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-    dcfg = ckpt["descriptor_config"]
+    dcfg = dict(ckpt["descriptor_config"])
+    # Backward compatibility with old checkpoints.
+    dcfg.pop("mag_ref", None)
     mcfg = ckpt["model_config"]
 
     descriptor = InvariantDescriptorBuilder(**dcfg).to(device)

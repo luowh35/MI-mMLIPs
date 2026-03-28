@@ -117,7 +117,6 @@ def load_config(config_path: Path) -> Dict[str, Any]:
             "num_radial": int(_must(model_cfg, "num_radial")),
             "l_max": int(_must(model_cfg, "l_max")),
             "include_imm": bool(model_cfg.get("include_imm", False)),
-            "mag_ref": float(model_cfg.get("mag_ref", 2.2)),
             "hidden_dim": int(_must(model_cfg, "hidden_dim")),
             "depth": int(_must(model_cfg, "depth")),
         },
@@ -334,7 +333,6 @@ def main() -> None:
         num_radial=cfg["model"]["num_radial"],
         l_max=cfg["model"]["l_max"],
         include_imm=cfg["model"]["include_imm"],
-        mag_ref=cfg["model"]["mag_ref"],
     ).to(device)
     model = LocalInvariantPotential(
         in_dim=descriptor.descriptor_dim,
@@ -401,7 +399,6 @@ def main() -> None:
                     "num_radial": cfg["model"]["num_radial"],
                     "l_max": cfg["model"]["l_max"],
                     "include_imm": cfg["model"]["include_imm"],
-                    "mag_ref": cfg["model"]["mag_ref"],
                 },
                 "optimizer_state": optimizer.state_dict(),
                 "run_config": run_config,

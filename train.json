@@ -26,7 +26,7 @@
     "lr": 0.001,  // Adam 学习率
     "weight_decay": 0.000001,  // Adam 权重衰减（L2 正则）
     "seed": 42,  // 随机种子（影响数据切分、参数初始化、shuffle）
-    "batch_size": 1,  // 当前实现仅支持 1（单帧训练，兼容不同原子数）
+    "batch_size": 1,  // 旧版脚本仅支持 1；若使用支持 flat-batch 的新版脚本可适当调大（如 2/4）
     "num_workers": 0,  // DataLoader 子进程数；CPU 读取瓶颈时可适当增加
     "energy_per_atom": true  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
   },
