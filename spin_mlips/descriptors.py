@@ -5,7 +5,7 @@ import time
 import torch
 import torch.nn as nn
 
-from .neighbor import build_neighbor_list
+from .neighbor import build_neighbor_list, half_to_full_edges
 
 
 class InvariantDescriptorBuilder(nn.Module):
@@ -192,6 +192,257 @@ class InvariantDescriptorBuilder(nn.Module):
             basis_terms = [u_i, u_norm] + basis_terms
         return torch.stack(basis_terms, dim=0)
 
+    def _build_triplet_indices(
+        self,
+        full_src: torch.Tensor,
+        n_atoms: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build triplet indices for angular channels.
+
+        For each center atom i, find all unique neighbor pairs (j, k) with j < k
+        in the edge list order.
+
+        Returns:
+            triplet_center: [T] center atom index for each triplet
+            edge_j: [T] index into full edge list for the j-th neighbor
+            edge_k: [T] index into full edge list for the k-th neighbor
+        """
+        device = full_src.device
+
+        counts = torch.bincount(full_src, minlength=n_atoms)  # [N]
+        offsets = torch.zeros(n_atoms + 1, dtype=torch.long, device=device)
+        offsets[1:] = torch.cumsum(counts, 0)
+
+        n_pairs = counts * (counts - 1) // 2  # [N]
+        total_pairs = int(n_pairs.sum().item())
+
+        if total_pairs == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty, empty
+
+        # Build local upper-triangular pair indices for each atom
+        max_neigh = int(counts.max().item())
+        # For each atom with k neighbors, we need pairs (a, b) where a < b < k
+        # Use repeat_interleave + arange trick
+
+        # Identify atoms that have at least 2 neighbors
+        has_pairs = counts >= 2
+        atom_ids = torch.where(has_pairs)[0]  # atoms with >= 2 neighbors
+
+        if atom_ids.numel() == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty, empty
+
+        atom_counts = counts[atom_ids]
+        atom_offsets = offsets[atom_ids]
+        atom_n_pairs = n_pairs[atom_ids]
+
+        # For each atom, generate upper-triangular indices
+        # Strategy: for atom with c neighbors, generate all (a, b) pairs where 0 <= a < b < c
+        triplet_center_list = []
+        edge_j_list = []
+        edge_k_list = []
+
+        # Vectorized approach: group atoms by neighbor count to avoid Python loops
+        # But for simplicity and correctness, use a compact vectorized method
+
+        # Generate all pairs using repeat_interleave
+        # For each atom, repeat its offset atom_n_pairs times
+        triplet_center = torch.repeat_interleave(atom_ids, atom_n_pairs)
+        rep_offsets = torch.repeat_interleave(atom_offsets, atom_n_pairs)
+        rep_counts = torch.repeat_interleave(atom_counts, atom_n_pairs)
+
+        # Now we need local (a, b) indices for each group
+        # Use a segmented approach: for each atom i with c_i neighbors,
+        # enumerate pairs (a, b) where 0 <= a < b < c_i
+        # The number of such pairs is c_i * (c_i - 1) / 2
+
+        # Build local pair indices using cumulative counting
+        # For each group of size n_pairs[i], we need to map sequential index -> (a, b)
+        group_sizes = atom_n_pairs  # [num_atoms_with_pairs]
+        group_offsets = torch.zeros(len(group_sizes) + 1, dtype=torch.long, device=device)
+        group_offsets[1:] = torch.cumsum(group_sizes, 0)
+
+        # Sequential index within each group
+        seq_idx = torch.arange(total_pairs, device=device)
+        # Map each triplet to its group (atom)
+        group_id = torch.bucketize(seq_idx, group_offsets[1:], right=True)
+        local_idx = seq_idx - group_offsets[group_id]
+
+        # Convert linear index to (a, b) upper triangular
+        # For a group with c neighbors: linear index t maps to (a, b)
+        # where a = c - 2 - floor((sqrt(8*(n_pairs-1-t)+1) - 1) / 2)
+        #       b = t + a + 1 - a*(2*c-a-1)//2  (inversion of triangular number)
+        c = rep_counts  # neighbor count for each triplet
+        n_p = c * (c - 1) // 2  # total pairs for each triplet's atom
+
+        # Use the formula: for upper triangular (row a, col b), a < b < c
+        # t = a * c - a * (a + 1) / 2 + (b - a - 1)
+        # Inverse: a = c - 2 - floor((sqrt(8*(n_p-1-t)+1) - 1) / 2)
+        t = local_idx
+        inv = n_p - 1 - t
+        # Careful with float precision
+        discriminant = (8.0 * inv.float() + 1.0).sqrt()
+        a = (c - 2) - ((discriminant - 1.0) / 2.0).long()
+        # Clamp a to valid range
+        a = torch.clamp(a, min=torch.zeros_like(c), max=(c - 2).clamp(min=0))
+        # Compute b from a and t
+        b = t - (a * c - a * (a + 1) // 2) + a + 1
+        # Clamp b
+        b = b.clamp(min=0)
+
+        edge_j = rep_offsets + a
+        edge_k = rep_offsets + b
+
+        return triplet_center, edge_j, edge_k
+
+    def _forward_vectorized(
+        self,
+        pos: torch.Tensor,
+        mag: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        nb: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fully vectorized descriptor computation using scatter_add and triplet indexing.
+        Replaces the per-atom Python loop in forward_with_blocks.
+        """
+        n_atoms = int(pos.shape[0])
+        device = pos.device
+
+        edge_index = nb["edge_index"]
+        edge_vec = nb["edge_vec"]
+        edge_dist = nb["edge_dist"]
+
+        # --- Expand to full (bidirectional) edge list ---
+        full_src, full_dst, full_vec, full_dist = half_to_full_edges(
+            edge_index, edge_vec, edge_dist
+        )
+
+        # Sort by source atom for consistent ordering (needed for triplet building)
+        sort_idx = torch.argsort(full_src, stable=True)
+        full_src = full_src[sort_idx]
+        full_dst = full_dst[sort_idx]
+        full_vec = full_vec[sort_idx]
+        full_dist = full_dist[sort_idx]
+
+        n_edges = full_src.shape[0]
+
+        # --- Radial basis for all edges ---
+        f_all = self.radial_basis(full_dist)  # [2E, num_radial]
+
+        # --- rho_u: onsite, per-atom (already vectorized) ---
+        u_all = (mag * mag).sum(dim=-1)  # [N]
+        rho_u = torch.stack([self.rho_u(u_all[i]) for i in range(n_atoms)], dim=0)  # [N, rho_u_dim]
+
+        # --- rho_r: sum of radial basis over neighbors ---
+        rho_r = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
+        if n_edges > 0:
+            rho_r.scatter_add_(0, full_src.unsqueeze(-1).expand_as(f_all), f_all)
+
+        # --- Magnetic dot products per edge ---
+        m_dst = mag[full_dst]  # [2E, 3]
+        m_src = mag[full_src]  # [2E, 3]
+        u_dst = (m_dst * m_dst).sum(dim=-1)  # [2E]
+        s_edge = (m_dst * m_src).sum(dim=-1)  # [2E] = m_j . m_i
+        s2_edge = s_edge * s_edge  # [2E]
+
+        # --- rho_uj: sum f(r) * u_j ---
+        rho_uj = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
+        if n_edges > 0:
+            rho_uj.scatter_add_(
+                0,
+                full_src.unsqueeze(-1).expand_as(f_all),
+                f_all * u_dst.unsqueeze(-1),
+            )
+
+        # --- rho_s: sum f(r) * s_ij ---
+        rho_s = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
+        if n_edges > 0:
+            rho_s.scatter_add_(
+                0,
+                full_src.unsqueeze(-1).expand_as(f_all),
+                f_all * s_edge.unsqueeze(-1),
+            )
+
+        # --- rho_s2 (optional) ---
+        rho_s2 = None
+        if self.include_s2:
+            rho_s2 = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
+            if n_edges > 0:
+                rho_s2.scatter_add_(
+                    0,
+                    full_src.unsqueeze(-1).expand_as(f_all),
+                    f_all * s2_edge.unsqueeze(-1),
+                )
+
+        # --- Angular channels: build triplet indices ---
+        R = self.num_radial
+        L = self.l_max + 1
+        a_rr = torch.zeros(n_atoms, R * R * L, device=device, dtype=pos.dtype)
+        a_jk = torch.zeros(n_atoms, R * R * L, device=device, dtype=pos.dtype)
+        a_imm = torch.zeros(n_atoms, R * R * L, device=device, dtype=pos.dtype) if self.include_imm else None
+
+        if n_edges > 0:
+            triplet_center, ej, ek = self._build_triplet_indices(full_src, n_atoms)
+
+            if triplet_center.numel() > 0:
+                # Compute cos(theta) for each triplet
+                vec_j = full_vec[ej]  # [T, 3]
+                vec_k = full_vec[ek]  # [T, 3]
+                dist_j = full_dist[ej]  # [T]
+                dist_k = full_dist[ek]  # [T]
+
+                cos_theta = (vec_j * vec_k).sum(dim=-1) / (dist_j * dist_k + self.eps)
+                p_l = self.legendre_basis(cos_theta)  # [T, L]
+
+                f_j = f_all[ej]  # [T, R]
+                f_k = f_all[ek]  # [T, R]
+
+                # pair = f_j ⊗ f_k + f_k ⊗ f_j  -> [T, R, R]
+                pair = f_j.unsqueeze(-1) * f_k.unsqueeze(1) + f_k.unsqueeze(-1) * f_j.unsqueeze(1)
+
+                # geom = pair * p_l -> [T, R, R, L]
+                geom = pair.unsqueeze(-1) * p_l.unsqueeze(1).unsqueeze(1)
+                geom_flat = geom.reshape(geom.shape[0], -1)  # [T, R*R*L]
+
+                # A_rr
+                tc_expand = triplet_center.unsqueeze(-1).expand_as(geom_flat)
+                a_rr.scatter_add_(0, tc_expand, geom_flat)
+
+                # A_jk: weight by m_j . m_k
+                dst_j = full_dst[ej]
+                dst_k = full_dst[ek]
+                q_jk = (mag[dst_j] * mag[dst_k]).sum(dim=-1)  # [T]
+                a_jk.scatter_add_(0, tc_expand, geom_flat * q_jk.unsqueeze(-1))
+
+                # A_imm: weight by s_ij * s_ik
+                if self.include_imm:
+                    s_j = s_edge[ej]  # [T]
+                    s_k = s_edge[ek]  # [T]
+                    p_ijk = s_j * s_k
+                    a_imm.scatter_add_(0, tc_expand, geom_flat * p_ijk.unsqueeze(-1))
+
+        # --- Assemble outputs ---
+        desc_parts = [rho_u, rho_r, a_rr, rho_uj, rho_s]
+        mag_parts = [rho_u, rho_uj, rho_s]
+        if self.include_s2:
+            desc_parts.append(rho_s2)
+            mag_parts.append(rho_s2)
+        desc_parts.append(a_jk)
+        mag_parts.append(a_jk)
+        if self.include_imm:
+            desc_parts.append(a_imm)
+            mag_parts.append(a_imm)
+
+        descriptor = torch.cat(desc_parts, dim=-1)       # [N, descriptor_dim]
+        geometry_block = torch.cat([rho_r, a_rr], dim=-1) # [N, geometry_dim]
+        magnetic_block = torch.cat(mag_parts, dim=-1)     # [N, magnetic_dim]
+
+        return descriptor, geometry_block, magnetic_block
+
     def forward_with_blocks(
         self,
         pos: torch.Tensor,
@@ -206,10 +457,6 @@ class InvariantDescriptorBuilder(nn.Module):
         - geometry_block: [N, geometry_dim] = [rho_r, A_rr]
         - magnetic_block: [N, magnetic_dim] = [rho_u, rho_uj, rho_s, rho_s2?, A_jk, A_imm?]
         """
-        n_atoms = int(pos.shape[0])
-        zeros_r = pos.new_zeros(self.num_radial)
-        zeros_a = pos.new_zeros(self.pair_angular_dim)
-
         if pbc is None:
             pbc = torch.ones(3, device=pos.device, dtype=torch.bool)
         else:
@@ -227,122 +474,15 @@ class InvariantDescriptorBuilder(nn.Module):
             profile["neighbor_s"] = (
                 profile.get("neighbor_s", 0.0) + (time.perf_counter() - neighbor_t0)
             )
-        neigh_idx = nb["neighbors"]
-        edge_index = nb["edge_index"]
-        edge_vec = nb["edge_vec"]
-        edge_dist = nb["edge_dist"]
 
         kernel_t0 = time.perf_counter()
-        neigh_vec: list[list[torch.Tensor]] = [[] for _ in range(n_atoms)]
-        neigh_len: list[list[torch.Tensor]] = [[] for _ in range(n_atoms)]
-        for e in range(edge_index.shape[1]):
-            i = int(edge_index[0, e].item())
-            j = int(edge_index[1, e].item())
-            rij = edge_vec[e]
-            r = edge_dist[e]
-            neigh_vec[i].append(rij)
-            neigh_len[i].append(r)
-            neigh_vec[j].append(-rij)
-            neigh_len[j].append(r)
-
-        all_desc = []
-        all_geom = []
-        all_mag = []
-
-        for i in range(n_atoms):
-            idx_i = neigh_idx[i]
-            m_i = mag[i]
-            u_i = (m_i * m_i).sum()
-            rho_u = self.rho_u(u_i)
-
-            if not idx_i:
-                rho_r = zeros_r
-                rho_uj = zeros_r
-                rho_s = zeros_r
-                rho_s2 = zeros_r if self.include_s2 else None
-                a_rr = zeros_a
-                a_jk = zeros_a
-                a_imm = zeros_a if self.include_imm else None
-            else:
-                idx = torch.tensor(idx_i, device=pos.device, dtype=torch.long)
-                r_vec = torch.stack(neigh_vec[i], dim=0)
-                r_len = torch.stack(neigh_len[i], dim=0)
-                m_j = mag[idx]
-                u_j = (m_j * m_j).sum(dim=-1)
-                s_ij = (m_j * m_i.unsqueeze(0)).sum(dim=-1)
-                s2_ij = s_ij * s_ij
-
-                f = self.radial_basis(r_len)
-                rho_r = f.sum(dim=0)
-                rho_uj = (f * u_j.unsqueeze(-1)).sum(dim=0)
-                rho_s = (f * s_ij.unsqueeze(-1)).sum(dim=0)
-                rho_s2 = (f * s2_ij.unsqueeze(-1)).sum(dim=0) if self.include_s2 else None
-
-                if idx.numel() >= 2:
-                    tri = torch.triu_indices(idx.numel(), idx.numel(), offset=1, device=pos.device)
-                    j_local, k_local = tri[0], tri[1]
-
-                    r_j = r_vec[j_local]
-                    r_k = r_vec[k_local]
-                    cos_theta = (r_j * r_k).sum(dim=-1) / (
-                        r_len[j_local] * r_len[k_local] + self.eps
-                    )
-                    p_l = self.legendre_basis(cos_theta)
-
-                    f_j = f[j_local]
-                    f_k = f[k_local]
-                    pair_jk = f_j.unsqueeze(-1) * f_k.unsqueeze(1)
-                    pair_kj = f_k.unsqueeze(-1) * f_j.unsqueeze(1)
-                    pair = pair_jk + pair_kj
-                    geom_tensor = pair.unsqueeze(-1) * p_l.unsqueeze(1).unsqueeze(1)
-
-                    a_rr = geom_tensor.sum(dim=0).reshape(-1)
-
-                    q_jk = (m_j[j_local] * m_j[k_local]).sum(dim=-1)
-                    a_jk = (geom_tensor * q_jk.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)).sum(
-                        dim=0
-                    ).reshape(-1)
-
-                    if self.include_imm:
-                        p_ijk = s_ij[j_local] * s_ij[k_local]
-                        a_imm = (
-                            geom_tensor
-                            * p_ijk.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                        ).sum(dim=0).reshape(-1)
-                    else:
-                        a_imm = None
-                else:
-                    a_rr = zeros_a
-                    a_jk = zeros_a
-                    a_imm = zeros_a if self.include_imm else None
-
-            desc_parts = [rho_u, rho_r, a_rr, rho_uj, rho_s]
-            mag_parts = [rho_u, rho_uj, rho_s]
-            if self.include_s2:
-                assert rho_s2 is not None
-                desc_parts.append(rho_s2)
-                mag_parts.append(rho_s2)
-            desc_parts.append(a_jk)
-            mag_parts.append(a_jk)
-            if self.include_imm:
-                assert a_imm is not None
-                desc_parts.append(a_imm)
-                mag_parts.append(a_imm)
-
-            all_desc.append(torch.cat(desc_parts, dim=0))
-            all_geom.append(torch.cat([rho_r, a_rr], dim=0))
-            all_mag.append(torch.cat(mag_parts, dim=0))
-
+        result = self._forward_vectorized(pos, mag, cell, pbc, nb)
         if profile is not None:
             profile["descriptor_kernel_s"] = (
                 profile.get("descriptor_kernel_s", 0.0) + (time.perf_counter() - kernel_t0)
             )
 
-        return (
-            torch.stack(all_desc, dim=0),
-            torch.stack(all_geom, dim=0),
-            torch.stack(all_mag, dim=0),
-        )
+        return result
 
     def forward(
         self,

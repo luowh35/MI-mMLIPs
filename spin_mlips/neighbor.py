@@ -39,6 +39,31 @@ def minimum_image_displacement(
     return wrapped @ cell
 
 
+def half_to_full_edges(
+    edge_index: torch.Tensor,
+    edge_vec: torch.Tensor,
+    edge_dist: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Expand a half edge list (i < j) to a full bidirectional edge list.
+
+    Returns:
+        full_src: [2E] source atom indices
+        full_dst: [2E] destination atom indices
+        full_vec: [2E, 3] displacement vectors (src -> dst)
+        full_dist: [2E] distances
+    """
+    src_half = edge_index[0]  # [E]
+    dst_half = edge_index[1]  # [E]
+
+    full_src = torch.cat([src_half, dst_half], dim=0)      # [2E]
+    full_dst = torch.cat([dst_half, src_half], dim=0)      # [2E]
+    full_vec = torch.cat([edge_vec, -edge_vec], dim=0)     # [2E, 3]
+    full_dist = torch.cat([edge_dist, edge_dist], dim=0)   # [2E]
+
+    return full_src, full_dst, full_vec, full_dist
+
+
 def build_neighbor_list(
     pos: torch.Tensor,
     cell: torch.Tensor,

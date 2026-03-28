@@ -1,14 +1,11 @@
 {
   "data": {
     "train_files": [  // 训练集 extxyz 文件列表；可放 1 个或多个文件，按帧拼接为总训练池
-      "pw_Fe16.extxyz",  // 平面波 Fe16 数据
-      "lcao_Fe16.extxyz",  // LCAO Fe16 数据
-      "pw_Fe32.extxyz",  // 平面波 Fe32 数据
-      "lcao_Fe32.extxyz"  // LCAO Fe32 数据
+      "train.xyz"  // 平面波 Fe16 数据
     ],
     "val_files": [],  // 验证集 extxyz 文件列表；为空时将从 train_files 内按 val_ratio 随机切分
     "val_ratio": 0.1,  // 当 val_files 为空时，随机划分出的验证集比例
-    "split_mode": "source_file",  // 切分模式：source_file / config_type / set / block / random
+    "split_mode": "random",  // 切分模式：source_file / config_type / set / block / random
     "split_group_key": "source_file",  // 分组键（source_file / config_type / set）；block 模式下表示轨迹来源键
     "split_block_size": 50,  // block 模式下每个连续轨迹块包含的帧数
     "max_train_frames_per_file": null,  // 每个训练文件最多读取多少帧；null 表示读取该文件全部帧（正式训练建议改成 null）
@@ -39,7 +36,7 @@
     "lr": 0.001,  // Adam 学习率
     "weight_decay": 0.000001,  // Adam 权重衰减（L2 正则）
     "seed": 42,  // 随机种子（影响数据切分、参数初始化、shuffle）
-    "batch_size": 1,  // 若显存仍很低且 CPU 忙，可先固定小 batch，优先提速数据/descriptor 管线
+    "batch_size": 24,  // 若显存仍很低且 CPU 忙，可先固定小 batch，优先提速数据/descriptor 管线
     "num_workers": 4,  // DataLoader 子进程数；建议 0->2->4 逐步测试吞吐
     "pin_memory": true,  // CUDA 训练时建议开启，可减少 H2D 拷贝等待
     "persistent_workers": true,  // num_workers>0 时保留 worker，减少每个 epoch 重启开销
@@ -50,7 +47,7 @@
   "loss": {
     "use_mag_loss": true,  // 是否使用磁梯度监督项（需要 extxyz 中含 magnetic_force）
     "w_energy": 1.0,  // 能量损失权重
-    "w_force": 20.0,  // 原子力损失权重
+    "w_force": 1.0,  // 原子力损失权重
     "w_mag": 1.0  // 磁梯度损失权重
   },
 
