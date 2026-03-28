@@ -223,25 +223,31 @@ def compute_losses(
         pred_e = pred_energy
         tgt_e = target_energy - center_pa * n_atoms
 
-    loss_e = (pred_e - tgt_e).pow(2).mean()
-    loss_f = (pred_forces - target_forces).pow(2).mean()
+    mse_e = (pred_e - tgt_e).pow(2).mean()
+    mse_f = (pred_forces - target_forces).pow(2).mean()
 
     if loss_cfg["use_mag_loss"] and ("mag_grad_flat" in batch) and (pred_mag_grad is not None):
         target_mag = batch["mag_grad_flat"].to(device=device, dtype=torch.float32)
-        loss_g = (pred_mag_grad - target_mag).pow(2).mean()
+        mse_g = (pred_mag_grad - target_mag).pow(2).mean()
     else:
-        loss_g = torch.tensor(0.0, device=device)
+        mse_g = torch.tensor(0.0, device=device)
 
     total = (
-        loss_cfg["w_energy"] * loss_e
-        + loss_cfg["w_force"] * loss_f
-        + loss_cfg["w_mag"] * loss_g
+        loss_cfg["w_energy"] * mse_e
+        + loss_cfg["w_force"] * mse_f
+        + loss_cfg["w_mag"] * mse_g
     )
+    rmse_e = torch.sqrt(mse_e)
+    rmse_f = torch.sqrt(mse_f)
+    rmse_g = torch.sqrt(mse_g)
     metrics = {
         "loss": float(total.detach()),
-        "loss_e": float(loss_e.detach()),
-        "loss_f": float(loss_f.detach()),
-        "loss_g": float(loss_g.detach()),
+        "loss_e_mse": float(mse_e.detach()),
+        "loss_f_mse": float(mse_f.detach()),
+        "loss_g_mse": float(mse_g.detach()),
+        "loss_e_rmse": float(rmse_e.detach()),
+        "loss_f_rmse": float(rmse_f.detach()),
+        "loss_g_rmse": float(rmse_g.detach()),
     }
     return total, metrics
 
@@ -263,7 +269,15 @@ def run_epoch(
         model.eval()
         descriptor.eval()
 
-    sums = {"loss": 0.0, "loss_e": 0.0, "loss_f": 0.0, "loss_g": 0.0}
+    sums = {
+        "loss": 0.0,
+        "loss_e_mse": 0.0,
+        "loss_f_mse": 0.0,
+        "loss_g_mse": 0.0,
+        "loss_e_rmse": 0.0,
+        "loss_f_rmse": 0.0,
+        "loss_g_rmse": 0.0,
+    }
     n_batches = 0
 
     for batch in loader:
@@ -440,9 +454,12 @@ def main() -> None:
                 f"epoch={epoch:03d} "
                 f"train_loss={train_metrics['loss']:.6f} "
                 f"val_loss={val_metrics['loss']:.6f} "
-                f"train_e={train_metrics['loss_e']:.6f} "
-                f"train_f={train_metrics['loss_f']:.6f} "
-                f"train_g={train_metrics['loss_g']:.6f} "
+                f"train_e_rmse={train_metrics['loss_e_rmse']:.6f} "
+                f"train_f_rmse={train_metrics['loss_f_rmse']:.6f} "
+                f"train_g_rmse={train_metrics['loss_g_rmse']:.6f} "
+                f"val_e_rmse={val_metrics['loss_e_rmse']:.6f} "
+                f"val_f_rmse={val_metrics['loss_f_rmse']:.6f} "
+                f"val_g_rmse={val_metrics['loss_g_rmse']:.6f} "
                 f"time={dt:.2f}s"
             )
 
