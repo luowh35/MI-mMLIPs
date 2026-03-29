@@ -42,6 +42,10 @@ Key updates in config:
 Training now prints timing terms such as `train_data_wait`, `train_desc`, `train_model`, `train_bwd`,
 and writes detailed timing dictionaries into `runs/.../metrics.jsonl`.
 For long runs, progress is printed every `log_interval_batches` (see `training.log_interval_batches`).
+Validation speed knobs:
+- `validate_every`: run validation every N epochs
+- `max_val_batches`: limit validation to first K batches
+- `val_force_loss` / `val_mag_loss`: skip expensive gradient-based val terms when needed
 
 ## 2) Scan fixed-structure E(m) curve
 

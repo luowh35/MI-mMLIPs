@@ -49,6 +49,7 @@ def predict_batch(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     create_graph: bool = True,
+    need_force_grad: bool = True,
     need_mag_grad: bool = True,
     profile: Dict[str, float] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -110,15 +111,20 @@ def predict_batch(
 
     # forces and mag_grad via autograd on the total energy
     total_energy = energies.sum()
-    force_t0 = time.perf_counter()
-    forces = -torch.autograd.grad(
-        total_energy,
-        pos_flat,
-        create_graph=create_graph,
-        retain_graph=need_mag_grad or create_graph,
-    )[0]
-    if profile is not None:
-        profile["grad_force_s"] = profile.get("grad_force_s", 0.0) + (time.perf_counter() - force_t0)
+    if need_force_grad:
+        force_t0 = time.perf_counter()
+        forces = -torch.autograd.grad(
+            total_energy,
+            pos_flat,
+            create_graph=create_graph,
+            retain_graph=need_mag_grad or create_graph,
+        )[0]
+        if profile is not None:
+            profile["grad_force_s"] = profile.get("grad_force_s", 0.0) + (
+                time.perf_counter() - force_t0
+            )
+    else:
+        forces = torch.zeros_like(pos_flat)
 
     if need_mag_grad:
         mag_t0 = time.perf_counter()

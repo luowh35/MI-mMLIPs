@@ -165,6 +165,15 @@ def load_config(config_path: Path) -> Dict[str, Any]:
                 if train_cfg.get("prefetch_factor") is not None
                 else None
             ),
+            "validate_every": int(train_cfg.get("validate_every", 1)),
+            "max_val_batches": (
+                int(train_cfg["max_val_batches"])
+                if train_cfg.get("max_val_batches") is not None
+                else None
+            ),
+            "val_force_loss": bool(train_cfg.get("val_force_loss", True)),
+            "val_mag_loss": bool(train_cfg.get("val_mag_loss", True)),
+            "log_interval_batches": int(train_cfg.get("log_interval_batches", 200)),
             "energy_per_atom": bool(train_cfg.get("energy_per_atom", True)),
         },
         "loss": {
@@ -321,6 +330,8 @@ def compute_losses(
     pred_mag_grad: torch.Tensor | None,
     device: torch.device,
     cfg: Dict[str, Any],
+    use_force_loss: bool = True,
+    use_mag_loss: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     loss_cfg = cfg["loss"]
     train_cfg = cfg["training"]
@@ -338,9 +349,17 @@ def compute_losses(
         tgt_e = target_energy - center_pa * n_atoms
 
     mse_e = (pred_e - tgt_e).pow(2).mean()
-    mse_f = (pred_forces - target_forces).pow(2).mean()
+    if use_force_loss:
+        mse_f = (pred_forces - target_forces).pow(2).mean()
+    else:
+        mse_f = torch.tensor(0.0, device=device)
 
-    if loss_cfg["use_mag_loss"] and ("mag_grad_flat" in batch) and (pred_mag_grad is not None):
+    if (
+        use_mag_loss
+        and loss_cfg["use_mag_loss"]
+        and ("mag_grad_flat" in batch)
+        and (pred_mag_grad is not None)
+    ):
         target_mag = batch["mag_grad_flat"].to(device=device, dtype=torch.float32)
         mse_g = (pred_mag_grad - target_mag).pow(2).mean()
     else:
@@ -376,6 +395,7 @@ def run_epoch(
     cfg: Dict[str, Any],
     epoch: int | None = None,
     phase: str = "train",
+    max_batches: int | None = None,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     is_train = optimizer is not None
     if is_train:
@@ -397,10 +417,23 @@ def run_epoch(
     n_batches = 0
     n_total_batches = len(loader)
     log_interval = int(cfg["training"].get("log_interval_batches", 200))
+    use_force_loss = bool(cfg["loss"]["w_force"] > 0.0)
+    use_mag_loss = bool(cfg["loss"]["w_mag"] > 0.0 and cfg["loss"]["use_mag_loss"])
+    if not is_train:
+        use_force_loss = use_force_loss and bool(cfg["training"].get("val_force_loss", True))
+        use_mag_loss = use_mag_loss and bool(cfg["training"].get("val_mag_loss", True))
+
+    n_effective_batches = n_total_batches
+    if max_batches is not None and max_batches > 0:
+        n_effective_batches = min(n_total_batches, int(max_batches))
     prefix = f"[progress] phase={phase}"
     if epoch is not None:
         prefix = f"[progress] epoch={epoch:03d} phase={phase}"
-    print(f"{prefix} start total_batches={n_total_batches}", flush=True)
+    print(
+        f"{prefix} start total_batches={n_total_batches} effective_batches={n_effective_batches} "
+        f"use_force_loss={use_force_loss} use_mag_loss={use_mag_loss}",
+        flush=True,
+    )
     timing = {
         "data_wait_s": 0.0,
         "predict_total_s": 0.0,
@@ -415,7 +448,7 @@ def run_epoch(
     iter_t0 = time.perf_counter()
     for batch in loader:
         timing["data_wait_s"] += time.perf_counter() - iter_t0
-        need_mag_grad = cfg["loss"]["use_mag_loss"] and ("mag_grad_flat" in batch)
+        need_mag_grad = use_mag_loss and ("mag_grad_flat" in batch)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -428,6 +461,7 @@ def run_epoch(
             batch=batch,
             device=device,
             create_graph=is_train,
+            need_force_grad=use_force_loss,
             need_mag_grad=need_mag_grad,
             profile=pred_profile,
         )
@@ -451,6 +485,8 @@ def run_epoch(
             pred_mag_grad=pred_mag_grad,
             device=device,
             cfg=cfg,
+            use_force_loss=use_force_loss,
+            use_mag_loss=use_mag_loss,
         )
         timing["loss_s"] += time.perf_counter() - loss_t0
 
@@ -464,7 +500,7 @@ def run_epoch(
             sums[k] += metrics[k]
         n_batches += 1
 
-        if log_interval > 0 and ((n_batches % log_interval == 0) or (n_batches == n_total_batches)):
+        if log_interval > 0 and ((n_batches % log_interval == 0) or (n_batches == n_effective_batches)):
             elapsed = (
                 timing["data_wait_s"]
                 + timing["predict_total_s"]
@@ -476,7 +512,7 @@ def run_epoch(
                 prefix = f"[progress] epoch={epoch:03d} phase={phase}"
             print(
                 f"{prefix} "
-                f"batch={n_batches}/{n_total_batches} "
+                f"batch={n_batches}/{n_effective_batches} "
                 f"elapsed={elapsed:.1f}s "
                 f"data_wait={timing['data_wait_s']:.1f}s "
                 f"desc={timing['descriptor_s']:.1f}s "
@@ -484,6 +520,8 @@ def run_epoch(
                 ,
                 flush=True
             )
+        if max_batches is not None and max_batches > 0 and n_batches >= int(max_batches):
+            break
         iter_t0 = time.perf_counter()
 
     if n_batches == 0:
@@ -622,6 +660,9 @@ def main() -> None:
     with log_path.open("w", encoding="utf-8") as logf:
         for epoch in range(1, cfg["training"]["epochs"] + 1):
             t0 = time.time()
+            do_val = bool(cfg["training"].get("validate_every", 1) > 0) and (
+                epoch % int(cfg["training"].get("validate_every", 1)) == 0
+            )
             train_metrics, train_timing = run_epoch(
                 loader=train_loader,
                 model=model,
@@ -632,16 +673,36 @@ def main() -> None:
                 epoch=epoch,
                 phase="train",
             )
-            val_metrics, val_timing = run_epoch(
-                loader=val_loader,
-                model=model,
-                descriptor=descriptor,
-                device=device,
-                optimizer=None,
-                cfg=cfg,
-                epoch=epoch,
-                phase="val",
-            )
+            if do_val:
+                val_metrics, val_timing = run_epoch(
+                    loader=val_loader,
+                    model=model,
+                    descriptor=descriptor,
+                    device=device,
+                    optimizer=None,
+                    cfg=cfg,
+                    epoch=epoch,
+                    phase="val",
+                    max_batches=cfg["training"].get("max_val_batches"),
+                )
+            else:
+                val_metrics = {k: float("nan") for k in train_metrics}
+                val_timing = {
+                    "data_wait_s": float("nan"),
+                    "predict_total_s": float("nan"),
+                    "descriptor_s": float("nan"),
+                    "model_s": float("nan"),
+                    "grad_force_s": float("nan"),
+                    "grad_mag_s": float("nan"),
+                    "loss_s": float("nan"),
+                    "backward_step_s": float("nan"),
+                    "n_batches": 0.0,
+                }
+                print(
+                    f"[info] epoch={epoch:03d} skip val "
+                    f"(validate_every={cfg['training'].get('validate_every', 1)})",
+                    flush=True,
+                )
             dt = time.time() - t0
 
             row = {
@@ -689,7 +750,7 @@ def main() -> None:
 
             if cfg["output"]["save_last"]:
                 torch.save(ckpt, last_path)
-            if cfg["output"]["save_best"] and val_metrics["loss"] < best_val:
+            if cfg["output"]["save_best"] and do_val and val_metrics["loss"] < best_val:
                 best_val = val_metrics["loss"]
                 torch.save(ckpt, best_path)
             if cfg["output"]["save_every_epoch"]:
