@@ -175,6 +175,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
             "val_mag_loss": bool(train_cfg.get("val_mag_loss", True)),
             "log_interval_batches": int(train_cfg.get("log_interval_batches", 200)),
             "energy_per_atom": bool(train_cfg.get("energy_per_atom", True)),
+            "use_amp": bool(train_cfg.get("use_amp", False)),
         },
         "loss": {
             "use_mag_loss": bool(loss_cfg.get("use_mag_loss", True)),
@@ -396,8 +397,11 @@ def run_epoch(
     epoch: int | None = None,
     phase: str = "train",
     max_batches: int | None = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     is_train = optimizer is not None
+    use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+
     if is_train:
         model.train()
         descriptor.train()
@@ -429,9 +433,10 @@ def run_epoch(
     prefix = f"[progress] phase={phase}"
     if epoch is not None:
         prefix = f"[progress] epoch={epoch:03d} phase={phase}"
+    amp_status = "enabled" if use_amp else "disabled"
     print(
         f"{prefix} start total_batches={n_total_batches} effective_batches={n_effective_batches} "
-        f"use_force_loss={use_force_loss} use_mag_loss={use_mag_loss}",
+        f"use_force_loss={use_force_loss} use_mag_loss={use_mag_loss} amp={amp_status}",
         flush=True,
     )
     timing = {
@@ -455,16 +460,32 @@ def run_epoch(
 
         pred_t0 = time.perf_counter()
         pred_profile: Dict[str, float] = {}
-        pred_energy, pred_forces, pred_mag_grad = predict_batch(
-            model=model,
-            descriptor_builder=descriptor,
-            batch=batch,
-            device=device,
-            create_graph=is_train,
-            need_force_grad=use_force_loss,
-            need_mag_grad=need_mag_grad,
-            profile=pred_profile,
-        )
+
+        # Use autocast for mixed precision if enabled
+        if use_amp and is_train:
+            with torch.cuda.amp.autocast():
+                pred_energy, pred_forces, pred_mag_grad = predict_batch(
+                    model=model,
+                    descriptor_builder=descriptor,
+                    batch=batch,
+                    device=device,
+                    create_graph=is_train,
+                    need_force_grad=use_force_loss,
+                    need_mag_grad=need_mag_grad,
+                    profile=pred_profile,
+                )
+        else:
+            pred_energy, pred_forces, pred_mag_grad = predict_batch(
+                model=model,
+                descriptor_builder=descriptor,
+                batch=batch,
+                device=device,
+                create_graph=is_train,
+                need_force_grad=use_force_loss,
+                need_mag_grad=need_mag_grad,
+                profile=pred_profile,
+            )
+
         timing["predict_total_s"] += time.perf_counter() - pred_t0
         timing["descriptor_s"] += pred_profile.get("descriptor_s", 0.0)
         timing["model_s"] += pred_profile.get("model_s", 0.0)
@@ -478,22 +499,40 @@ def run_epoch(
                 pred_mag_grad = pred_mag_grad.detach()
 
         loss_t0 = time.perf_counter()
-        loss, metrics = compute_losses(
-            batch=batch,
-            pred_energy=pred_energy,
-            pred_forces=pred_forces,
-            pred_mag_grad=pred_mag_grad,
-            device=device,
-            cfg=cfg,
-            use_force_loss=use_force_loss,
-            use_mag_loss=use_mag_loss,
-        )
+        if use_amp and is_train:
+            with torch.cuda.amp.autocast():
+                loss, metrics = compute_losses(
+                    batch=batch,
+                    pred_energy=pred_energy,
+                    pred_forces=pred_forces,
+                    pred_mag_grad=pred_mag_grad,
+                    device=device,
+                    cfg=cfg,
+                    use_force_loss=use_force_loss,
+                    use_mag_loss=use_mag_loss,
+                )
+        else:
+            loss, metrics = compute_losses(
+                batch=batch,
+                pred_energy=pred_energy,
+                pred_forces=pred_forces,
+                pred_mag_grad=pred_mag_grad,
+                device=device,
+                cfg=cfg,
+                use_force_loss=use_force_loss,
+                use_mag_loss=use_mag_loss,
+            )
         timing["loss_s"] += time.perf_counter() - loss_t0
 
         if is_train:
             bw_t0 = time.perf_counter()
-            loss.backward()
-            optimizer.step()
+            if use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             timing["backward_step_s"] += time.perf_counter() - bw_t0
 
         for k in sums:
@@ -647,6 +686,12 @@ def main() -> None:
         weight_decay=cfg["training"]["weight_decay"],
     )
 
+    # Create GradScaler for mixed precision training
+    use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print("[info] Mixed precision training (AMP) enabled", flush=True)
+
     run_config = _json_ready(cfg)
     run_config["runtime"]["device_resolved"] = str(device)
     with (output_dir / "config.resolved.json").open("w", encoding="utf-8") as f:
@@ -672,6 +717,7 @@ def main() -> None:
                 cfg=cfg,
                 epoch=epoch,
                 phase="train",
+                scaler=scaler,
             )
             if do_val:
                 val_metrics, val_timing = run_epoch(
@@ -684,6 +730,7 @@ def main() -> None:
                     epoch=epoch,
                     phase="val",
                     max_batches=cfg["training"].get("max_val_batches"),
+                    scaler=None,
                 )
             else:
                 val_metrics = {k: float("nan") for k in train_metrics}

@@ -5,7 +5,7 @@ import time
 import torch
 import torch.nn as nn
 
-from .neighbor import build_neighbor_list, half_to_full_edges
+from .neighbor import build_neighbor_list, build_neighbor_list_batch, half_to_full_edges
 
 
 class InvariantDescriptorBuilder(nn.Module):
@@ -451,21 +451,183 @@ class InvariantDescriptorBuilder(nn.Module):
         n_atoms: torch.Tensor,
         pbc: torch.Tensor | None = None,
         profile: dict[str, float] | None = None,
+        use_true_batch: bool = True,
     ) -> torch.Tensor:
-        """Batch-aware forward: split flat tensors per frame, compute descriptors, cat back."""
-        pos_splits = torch.split(pos_flat, n_atoms.tolist())
-        mag_splits = torch.split(mag_flat, n_atoms.tolist())
+        """
+        Batch-aware forward.
+
+        Args:
+            use_true_batch: If True, use vectorized batch processing (faster on GPU).
+                           If False, use per-frame loop (original behavior).
+        """
+        if use_true_batch and cell.shape[0] > 1:
+            # Use true batch processing
+            return self._forward_batch_vectorized(
+                pos_flat, mag_flat, cell, n_atoms, pbc, profile
+            )
+        else:
+            # Fall back to per-frame loop
+            pos_splits = torch.split(pos_flat, n_atoms.tolist())
+            mag_splits = torch.split(mag_flat, n_atoms.tolist())
+            if pbc is None:
+                pbc = torch.ones((cell.shape[0], 3), device=cell.device, dtype=torch.bool)
+            descs = []
+            for pos_i, mag_i, cell_i, pbc_i in zip(pos_splits, mag_splits, cell, pbc):
+                frame_t0 = time.perf_counter()
+                descs.append(self.forward(pos_i, mag_i, cell_i, pbc=pbc_i, profile=profile))
+                if profile is not None:
+                    profile["descriptor_s"] = (
+                        profile.get("descriptor_s", 0.0) + (time.perf_counter() - frame_t0)
+                    )
+            return torch.cat(descs, dim=0)
+
+    def _forward_batch_vectorized(
+        self,
+        pos_flat: torch.Tensor,
+        mag_flat: torch.Tensor,
+        cell: torch.Tensor,
+        n_atoms: torch.Tensor,
+        pbc: torch.Tensor | None = None,
+        profile: dict[str, float] | None = None,
+    ) -> torch.Tensor:
+        """
+        True vectorized batch processing - all structures processed together.
+        """
         if pbc is None:
             pbc = torch.ones((cell.shape[0], 3), device=cell.device, dtype=torch.bool)
-        descs = []
-        for pos_i, mag_i, cell_i, pbc_i in zip(pos_splits, mag_splits, cell, pbc):
-            frame_t0 = time.perf_counter()
-            descs.append(self.forward(pos_i, mag_i, cell_i, pbc=pbc_i, profile=profile))
-            if profile is not None:
-                profile["descriptor_s"] = (
-                    profile.get("descriptor_s", 0.0) + (time.perf_counter() - frame_t0)
-                )
-        return torch.cat(descs, dim=0)
+
+        device = pos_flat.device
+        B = n_atoms.shape[0]
+        N_total = pos_flat.shape[0]
+
+        # Build batch neighbor list
+        neighbor_t0 = time.perf_counter()
+        nb = build_neighbor_list_batch(
+            pos_flat=pos_flat,
+            cell=cell,
+            pbc=pbc,
+            n_atoms=n_atoms,
+            cutoff=self.cutoff,
+            eps=self.eps,
+        )
+        if profile is not None:
+            profile["neighbor_s"] = (
+                profile.get("neighbor_s", 0.0) + (time.perf_counter() - neighbor_t0)
+            )
+
+        kernel_t0 = time.perf_counter()
+
+        edge_index = nb["edge_index"]
+        edge_vec = nb["edge_vec"]
+        edge_dist = nb["edge_dist"]
+
+        # Expand to full edges
+        full_src, full_dst, full_vec, full_dist = half_to_full_edges(
+            edge_index, edge_vec, edge_dist
+        )
+
+        # Sort by source for consistent ordering
+        sort_idx = torch.argsort(full_src, stable=True)
+        full_src = full_src[sort_idx]
+        full_dst = full_dst[sort_idx]
+        full_vec = full_vec[sort_idx]
+        full_dist = full_dist[sort_idx]
+
+        n_edges = full_src.shape[0]
+
+        # Radial basis
+        f_all = self.radial_basis(full_dist)  # [2E, num_radial]
+
+        # rho_u: onsite
+        u_all = (mag_flat * mag_flat).sum(dim=-1)  # [N_total]
+        rho_u = self.rho_u_batch(u_all)  # [N_total, rho_u_dim]
+
+        # rho_r
+        rho_r = torch.zeros(N_total, self.num_radial, device=device, dtype=pos_flat.dtype)
+        if n_edges > 0:
+            rho_r.index_add_(0, full_src, f_all)
+
+        # Magnetic dot products
+        m_dst = mag_flat[full_dst]  # [2E, 3]
+        m_src = mag_flat[full_src]  # [2E, 3]
+        u_dst = (m_dst * m_dst).sum(dim=-1)  # [2E]
+        s_edge = (m_dst * m_src).sum(dim=-1)  # [2E]
+        s2_edge = s_edge * s_edge  # [2E]
+
+        # rho_uj
+        rho_uj = torch.zeros(N_total, self.num_radial, device=device, dtype=pos_flat.dtype)
+        if n_edges > 0:
+            rho_uj.index_add_(0, full_src, f_all * u_dst.unsqueeze(-1))
+
+        # rho_s
+        rho_s = torch.zeros(N_total, self.num_radial, device=device, dtype=pos_flat.dtype)
+        if n_edges > 0:
+            rho_s.index_add_(0, full_src, f_all * s_edge.unsqueeze(-1))
+
+        # rho_s2 (optional)
+        rho_s2 = None
+        if self.include_s2:
+            rho_s2 = torch.zeros(N_total, self.num_radial, device=device, dtype=pos_flat.dtype)
+            if n_edges > 0:
+                rho_s2.index_add_(0, full_src, f_all * s2_edge.unsqueeze(-1))
+
+        # Angular channels
+        R = self.num_radial
+        L = self.l_max + 1
+        a_rr = torch.zeros(N_total, R * R * L, device=device, dtype=pos_flat.dtype)
+        a_jk = torch.zeros(N_total, R * R * L, device=device, dtype=pos_flat.dtype)
+        a_imm = torch.zeros(N_total, R * R * L, device=device, dtype=pos_flat.dtype) if self.include_imm else None
+
+        if n_edges > 0:
+            triplet_center, ej, ek = self._build_triplet_indices(full_src, N_total)
+
+            if triplet_center.numel() > 0:
+                vec_j = full_vec[ej]
+                vec_k = full_vec[ek]
+                dist_j = full_dist[ej]
+                dist_k = full_dist[ek]
+
+                cos_theta = (vec_j * vec_k).sum(dim=-1) / (dist_j * dist_k + self.eps)
+                p_l = self.legendre_basis(cos_theta)
+
+                f_j = f_all[ej]
+                f_k = f_all[ek]
+
+                pair_flat = (
+                    f_j.unsqueeze(-1) * f_k.unsqueeze(1)
+                    + f_k.unsqueeze(-1) * f_j.unsqueeze(1)
+                ).reshape(f_j.shape[0], -1)
+                geom_flat = torch.einsum("tp,tl->tpl", pair_flat, p_l).reshape(pair_flat.shape[0], -1)
+
+                a_rr.index_add_(0, triplet_center, geom_flat)
+
+                dst_j = full_dst[ej]
+                dst_k = full_dst[ek]
+                q_jk = (mag_flat[dst_j] * mag_flat[dst_k]).sum(dim=-1)
+                a_jk.index_add_(0, triplet_center, geom_flat * q_jk.unsqueeze(-1))
+
+                if self.include_imm:
+                    s_j = s_edge[ej]
+                    s_k = s_edge[ek]
+                    p_ijk = s_j * s_k
+                    a_imm.index_add_(0, triplet_center, geom_flat * p_ijk.unsqueeze(-1))
+
+        # Assemble descriptor
+        desc_parts = [rho_u, rho_r, a_rr, rho_uj, rho_s]
+        if self.include_s2:
+            desc_parts.append(rho_s2)
+        desc_parts.append(a_jk)
+        if self.include_imm:
+            desc_parts.append(a_imm)
+
+        descriptor = torch.cat(desc_parts, dim=-1)
+
+        if profile is not None:
+            profile["descriptor_kernel_s"] = (
+                profile.get("descriptor_kernel_s", 0.0) + (time.perf_counter() - kernel_t0)
+            )
+
+        return descriptor
 
     def forward_batch_with_blocks(
         self,

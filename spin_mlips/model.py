@@ -111,22 +111,42 @@ def predict_batch(
 
     # forces and mag_grad via autograd on the total energy
     total_energy = energies.sum()
-    if need_force_grad:
+
+    # Compute both gradients in a single autograd.grad call to avoid redundant graph traversal
+    if need_force_grad and need_mag_grad:
+        grad_t0 = time.perf_counter()
+        grads = torch.autograd.grad(
+            total_energy,
+            [pos_flat, mag_flat],
+            create_graph=create_graph,
+            retain_graph=create_graph,
+        )
+        forces = -grads[0]
+        mag_grad = -grads[1]
+        if profile is not None:
+            grad_time = time.perf_counter() - grad_t0
+            # Split time proportionally by gradient size for backward compatibility
+            total_numel = pos_flat.numel() + mag_flat.numel()
+            profile["grad_force_s"] = profile.get("grad_force_s", 0.0) + (
+                grad_time * pos_flat.numel() / total_numel
+            )
+            profile["grad_mag_s"] = profile.get("grad_mag_s", 0.0) + (
+                grad_time * mag_flat.numel() / total_numel
+            )
+    elif need_force_grad:
         force_t0 = time.perf_counter()
         forces = -torch.autograd.grad(
             total_energy,
             pos_flat,
             create_graph=create_graph,
-            retain_graph=need_mag_grad or create_graph,
+            retain_graph=create_graph,
         )[0]
         if profile is not None:
             profile["grad_force_s"] = profile.get("grad_force_s", 0.0) + (
                 time.perf_counter() - force_t0
             )
-    else:
-        forces = torch.zeros_like(pos_flat)
-
-    if need_mag_grad:
+        mag_grad = None
+    elif need_mag_grad:
         mag_t0 = time.perf_counter()
         mag_grad = -torch.autograd.grad(
             total_energy,
@@ -136,7 +156,9 @@ def predict_batch(
         )[0]
         if profile is not None:
             profile["grad_mag_s"] = profile.get("grad_mag_s", 0.0) + (time.perf_counter() - mag_t0)
+        forces = torch.zeros_like(pos_flat)
     else:
+        forces = torch.zeros_like(pos_flat)
         mag_grad = None
 
     return energies, forces, mag_grad

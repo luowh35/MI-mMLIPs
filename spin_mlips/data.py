@@ -67,6 +67,7 @@ class ExtXYZDataset(Dataset):
         files: Sequence[str | Path],
         include_mag_grad: bool = True,
         max_frames_per_file: Optional[int] = None,
+        cache_tensors: bool = True,
     ) -> None:
         if not files:
             raise ValueError("No extxyz files provided.")
@@ -78,7 +79,9 @@ class ExtXYZDataset(Dataset):
         self.files = [Path(f) for f in files]
         self.include_mag_grad = include_mag_grad
         self.max_frames_per_file = max_frames_per_file
+        self.cache_tensors = cache_tensors
         self.frames: List[_AseFrame] = []
+        self._tensor_cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
         for path in self.files:
             if not path.exists():
@@ -160,6 +163,10 @@ class ExtXYZDataset(Dataset):
         return len(self.frames)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str]:
+        # Check cache first
+        if self.cache_tensors and index in self._tensor_cache:
+            return self._tensor_cache[index]
+
         frame = self.frames[index]
         sample: Dict[str, torch.Tensor | str] = {
             "pos": torch.from_numpy(frame.pos),
@@ -176,6 +183,11 @@ class ExtXYZDataset(Dataset):
             sample["set"] = frame.set_name
         if self.include_mag_grad and frame.mag_grad is not None:
             sample["mag_grad"] = torch.from_numpy(frame.mag_grad)
+
+        # Cache the result
+        if self.cache_tensors:
+            self._tensor_cache[index] = sample
+
         return sample
 
 

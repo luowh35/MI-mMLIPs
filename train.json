@@ -46,7 +46,8 @@
     "val_force_loss": true,  // 验证时是否计算 force 项（关闭可加速 val）
     "val_mag_loss": true,  // 验证时是否计算磁梯度项（关闭可加速 val）
     "log_interval_batches": 200,  // 每多少个 batch 打印一次进度（<=0 表示关闭）
-    "energy_per_atom": true  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
+    "energy_per_atom": true,  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
+    "use_amp": true  // 是否使用混合精度训练（GPU 上可显著加速，需要 CUDA）
   },
 
   "loss": {

@@ -146,3 +146,97 @@ def build_neighbor_list(
         "edge_unit": edge_unit,
         "neighbors": neighbors,
     }
+
+
+def build_neighbor_list_batch(
+    pos_flat: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    n_atoms: torch.Tensor,
+    cutoff: float,
+    eps: float = 1e-12,
+) -> Dict[str, torch.Tensor]:
+    """
+    Build neighbor lists for a batch of structures.
+
+    Args:
+        pos_flat: [N_total, 3] flattened positions
+        cell: [B, 3, 3] cell matrices
+        pbc: [B, 3] periodic boundary conditions
+        n_atoms: [B] number of atoms per structure
+        cutoff: neighbor cutoff radius
+        eps: small value for numerical stability
+
+    Returns:
+        dict with:
+        - edge_index: [2, E_total] global edge indices
+        - edge_vec: [E_total, 3] displacement vectors
+        - edge_dist: [E_total] distances
+        - edge_unit: [E_total, 3] unit vectors
+        - batch_edge: [E_total] batch index for each edge
+    """
+    device = pos_flat.device
+    B = n_atoms.shape[0]
+
+    # Compute atom offsets for global indexing
+    atom_offsets = torch.zeros(B + 1, dtype=torch.long, device=device)
+    atom_offsets[1:] = torch.cumsum(n_atoms, 0)
+
+    all_edge_src = []
+    all_edge_dst = []
+    all_edge_vec = []
+    all_edge_dist = []
+    all_batch_edge = []
+
+    for b in range(B):
+        start = atom_offsets[b]
+        end = atom_offsets[b + 1]
+        n = n_atoms[b].item()
+
+        if n < 2:
+            continue
+
+        pos_b = pos_flat[start:end]
+        cell_b = cell[b]
+        pbc_b = pbc[b]
+
+        # Build neighbor list for this structure
+        nb = build_neighbor_list(pos_b, cell_b, pbc_b, cutoff, eps)
+
+        if nb["edge_index"].shape[1] > 0:
+            # Offset indices to global indexing
+            edge_src = nb["edge_index"][0] + start
+            edge_dst = nb["edge_index"][1] + start
+
+            all_edge_src.append(edge_src)
+            all_edge_dst.append(edge_dst)
+            all_edge_vec.append(nb["edge_vec"])
+            all_edge_dist.append(nb["edge_dist"])
+            all_batch_edge.append(torch.full((edge_src.shape[0],), b, dtype=torch.long, device=device))
+
+    if not all_edge_src:
+        # No edges in entire batch
+        return {
+            "edge_index": torch.empty((2, 0), device=device, dtype=torch.long),
+            "edge_vec": torch.empty((0, 3), device=device, dtype=pos_flat.dtype),
+            "edge_dist": torch.empty((0,), device=device, dtype=pos_flat.dtype),
+            "edge_unit": torch.empty((0, 3), device=device, dtype=pos_flat.dtype),
+            "batch_edge": torch.empty((0,), device=device, dtype=torch.long),
+        }
+
+    edge_src = torch.cat(all_edge_src, dim=0)
+    edge_dst = torch.cat(all_edge_dst, dim=0)
+    edge_vec = torch.cat(all_edge_vec, dim=0)
+    edge_dist = torch.cat(all_edge_dist, dim=0)
+    batch_edge = torch.cat(all_batch_edge, dim=0)
+
+    edge_index = torch.stack([edge_src, edge_dst], dim=0)
+    edge_unit = edge_vec / (edge_dist.unsqueeze(-1) + eps)
+
+    return {
+        "edge_index": edge_index,
+        "edge_vec": edge_vec,
+        "edge_dist": edge_dist,
+        "edge_unit": edge_unit,
+        "batch_edge": batch_edge,
+    }
