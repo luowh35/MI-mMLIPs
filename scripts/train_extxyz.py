@@ -397,6 +397,10 @@ def run_epoch(
     n_batches = 0
     n_total_batches = len(loader)
     log_interval = int(cfg["training"].get("log_interval_batches", 200))
+    prefix = f"[progress] phase={phase}"
+    if epoch is not None:
+        prefix = f"[progress] epoch={epoch:03d} phase={phase}"
+    print(f"{prefix} start total_batches={n_total_batches}", flush=True)
     timing = {
         "data_wait_s": 0.0,
         "predict_total_s": 0.0,
@@ -477,6 +481,8 @@ def run_epoch(
                 f"data_wait={timing['data_wait_s']:.1f}s "
                 f"desc={timing['descriptor_s']:.1f}s "
                 f"bwd={timing['backward_step_s']:.1f}s"
+                ,
+                flush=True
             )
         iter_t0 = time.perf_counter()
 
@@ -519,8 +525,10 @@ def main() -> None:
     print(
         "[info] dataset split mode: "
         f"{cfg['data']['split_mode']} (train={len(train_ds)}, val={len(val_ds)})"
+        ,
+        flush=True
     )
-    print(f"[info] dataset build/split time: {t_build_ds:.2f}s")
+    print(f"[info] dataset build/split time: {t_build_ds:.2f}s", flush=True)
 
     if cfg["model"]["u_norm_mode"] in {"dataset", "dual"} and cfg["model"]["m_stat"] is None:
         t_m_stat0 = time.perf_counter()
@@ -533,8 +541,10 @@ def main() -> None:
         print(
             "[info] magnetic norm scale m_stat estimated from training set: "
             f"{cfg['model']['m_stat']:.8f} (mode={cfg['model']['m_stat_mode']})"
+            ,
+            flush=True
         )
-        print(f"[info] m_stat estimation time: {t_m_stat:.2f}s")
+        print(f"[info] m_stat estimation time: {t_m_stat:.2f}s", flush=True)
 
     t_center0 = time.perf_counter()
     cfg["training"]["energy_center_per_atom"] = resolve_energy_center_per_atom(train_ds)
@@ -542,8 +552,10 @@ def main() -> None:
     print(
         "[info] energy center (per atom) estimated from training set: "
         f"{cfg['training']['energy_center_per_atom']:.8f}"
+        ,
+        flush=True
     )
-    print(f"[info] energy center estimation time: {t_center:.2f}s")
+    print(f"[info] energy center estimation time: {t_center:.2f}s", flush=True)
     num_workers = int(cfg["training"]["num_workers"])
     pin_memory = bool(cfg["training"].get("pin_memory", True)) and device.type == "cuda"
     persistent_workers = bool(cfg["training"].get("persistent_workers", True)) and num_workers > 0
@@ -566,6 +578,8 @@ def main() -> None:
         f"pin_memory={pin_memory} "
         f"persistent_workers={loader_common_kwargs.get('persistent_workers', False)} "
         f"prefetch_factor={loader_common_kwargs.get('prefetch_factor', 'default')}"
+        ,
+        flush=True
     )
     train_loader = DataLoader(train_ds, shuffle=True, **loader_common_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_common_kwargs)
@@ -696,13 +710,15 @@ def main() -> None:
                 f"train_desc={train_timing['descriptor_s']:.2f}s "
                 f"train_model={train_timing['model_s']:.2f}s "
                 f"train_bwd={train_timing['backward_step_s']:.2f}s"
+                ,
+                flush=True
             )
 
     if cfg["output"]["save_best"]:
-        print(f"[done] best checkpoint: {best_path}")
+        print(f"[done] best checkpoint: {best_path}", flush=True)
     if cfg["output"]["save_last"]:
-        print(f"[done] last checkpoint: {last_path}")
-    print(f"[done] metrics log: {log_path}")
+        print(f"[done] last checkpoint: {last_path}", flush=True)
+    print(f"[done] metrics log: {log_path}", flush=True)
 
 
 if __name__ == "__main__":

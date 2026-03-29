@@ -192,6 +192,26 @@ class InvariantDescriptorBuilder(nn.Module):
             basis_terms = [u_i, u_norm] + basis_terms
         return torch.stack(basis_terms, dim=0)
 
+    def rho_u_batch(self, u_all: torch.Tensor) -> torch.Tensor:
+        """Vectorized rho_u over all atoms: u_all [N] -> [N, rho_u_dim]."""
+        u_norm = u_all / self._u_ref
+
+        if self.rho_u_basis == "power":
+            basis_terms = [u_norm.pow(p) for p in range(1, self.rho_u_degree + 1)]
+        else:
+            x = ((u_all - self._u_center) / (self._u_scale + self.eps)).clamp(-1.0, 1.0)
+            polys = [torch.ones_like(x), x]
+            for l in range(1, self.rho_u_degree):
+                p_l = polys[-1]
+                p_lm1 = polys[-2]
+                p_lp1 = ((2 * l + 1) * x * p_l - l * p_lm1) / (l + 1)
+                polys.append(p_lp1)
+            basis_terms = polys[1 : self.rho_u_degree + 1]
+
+        if self.u_norm_mode == "dual":
+            basis_terms = [u_all, u_norm] + basis_terms
+        return torch.stack(basis_terms, dim=-1)
+
     def _build_triplet_indices(
         self,
         full_src: torch.Tensor,
@@ -209,93 +229,28 @@ class InvariantDescriptorBuilder(nn.Module):
             edge_k: [T] index into full edge list for the k-th neighbor
         """
         device = full_src.device
-
         counts = torch.bincount(full_src, minlength=n_atoms)  # [N]
+        if not bool((counts >= 2).any().item()):
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty, empty
+
         offsets = torch.zeros(n_atoms + 1, dtype=torch.long, device=device)
         offsets[1:] = torch.cumsum(counts, 0)
+        starts = offsets[:-1]  # [N]
 
-        n_pairs = counts * (counts - 1) // 2  # [N]
-        total_pairs = int(n_pairs.sum().item())
-
-        if total_pairs == 0:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return empty, empty, empty
-
-        # Build local upper-triangular pair indices for each atom
         max_neigh = int(counts.max().item())
-        # For each atom with k neighbors, we need pairs (a, b) where a < b < k
-        # Use repeat_interleave + arange trick
-
-        # Identify atoms that have at least 2 neighbors
-        has_pairs = counts >= 2
-        atom_ids = torch.where(has_pairs)[0]  # atoms with >= 2 neighbors
-
-        if atom_ids.numel() == 0:
+        local_j, local_k = torch.triu_indices(max_neigh, max_neigh, offset=1, device=device)
+        if local_j.numel() == 0:
             empty = torch.empty(0, dtype=torch.long, device=device)
             return empty, empty, empty
 
-        atom_counts = counts[atom_ids]
-        atom_offsets = offsets[atom_ids]
-        atom_n_pairs = n_pairs[atom_ids]
+        # For each center i, keep local pairs (a,b) where b < count_i.
+        valid = local_k.unsqueeze(0) < counts.unsqueeze(1)  # [N, Pmax]
+        centers = torch.arange(n_atoms, device=device).unsqueeze(1).expand_as(valid)[valid]
 
-        # For each atom, generate upper-triangular indices
-        # Strategy: for atom with c neighbors, generate all (a, b) pairs where 0 <= a < b < c
-        triplet_center_list = []
-        edge_j_list = []
-        edge_k_list = []
-
-        # Vectorized approach: group atoms by neighbor count to avoid Python loops
-        # But for simplicity and correctness, use a compact vectorized method
-
-        # Generate all pairs using repeat_interleave
-        # For each atom, repeat its offset atom_n_pairs times
-        triplet_center = torch.repeat_interleave(atom_ids, atom_n_pairs)
-        rep_offsets = torch.repeat_interleave(atom_offsets, atom_n_pairs)
-        rep_counts = torch.repeat_interleave(atom_counts, atom_n_pairs)
-
-        # Now we need local (a, b) indices for each group
-        # Use a segmented approach: for each atom i with c_i neighbors,
-        # enumerate pairs (a, b) where 0 <= a < b < c_i
-        # The number of such pairs is c_i * (c_i - 1) / 2
-
-        # Build local pair indices using cumulative counting
-        # For each group of size n_pairs[i], we need to map sequential index -> (a, b)
-        group_sizes = atom_n_pairs  # [num_atoms_with_pairs]
-        group_offsets = torch.zeros(len(group_sizes) + 1, dtype=torch.long, device=device)
-        group_offsets[1:] = torch.cumsum(group_sizes, 0)
-
-        # Sequential index within each group
-        seq_idx = torch.arange(total_pairs, device=device)
-        # Map each triplet to its group (atom)
-        group_id = torch.bucketize(seq_idx, group_offsets[1:], right=True)
-        local_idx = seq_idx - group_offsets[group_id]
-
-        # Convert linear index to (a, b) upper triangular
-        # For a group with c neighbors: linear index t maps to (a, b)
-        # where a = c - 2 - floor((sqrt(8*(n_pairs-1-t)+1) - 1) / 2)
-        #       b = t + a + 1 - a*(2*c-a-1)//2  (inversion of triangular number)
-        c = rep_counts  # neighbor count for each triplet
-        n_p = c * (c - 1) // 2  # total pairs for each triplet's atom
-
-        # Use the formula: for upper triangular (row a, col b), a < b < c
-        # t = a * c - a * (a + 1) / 2 + (b - a - 1)
-        # Inverse: a = c - 2 - floor((sqrt(8*(n_p-1-t)+1) - 1) / 2)
-        t = local_idx
-        inv = n_p - 1 - t
-        # Careful with float precision
-        discriminant = (8.0 * inv.float() + 1.0).sqrt()
-        a = (c - 2) - ((discriminant - 1.0) / 2.0).long()
-        # Clamp a to valid range
-        a = torch.clamp(a, min=torch.zeros_like(c), max=(c - 2).clamp(min=0))
-        # Compute b from a and t
-        b = t - (a * c - a * (a + 1) // 2) + a + 1
-        # Clamp b
-        b = b.clamp(min=0)
-
-        edge_j = rep_offsets + a
-        edge_k = rep_offsets + b
-
-        return triplet_center, edge_j, edge_k
+        edge_j = (starts.unsqueeze(1) + local_j.unsqueeze(0))[valid]
+        edge_k = (starts.unsqueeze(1) + local_k.unsqueeze(0))[valid]
+        return centers, edge_j, edge_k
 
     def _forward_vectorized(
         self,
@@ -333,14 +288,14 @@ class InvariantDescriptorBuilder(nn.Module):
         # --- Radial basis for all edges ---
         f_all = self.radial_basis(full_dist)  # [2E, num_radial]
 
-        # --- rho_u: onsite, per-atom (already vectorized) ---
+        # --- rho_u: onsite ---
         u_all = (mag * mag).sum(dim=-1)  # [N]
-        rho_u = torch.stack([self.rho_u(u_all[i]) for i in range(n_atoms)], dim=0)  # [N, rho_u_dim]
+        rho_u = self.rho_u_batch(u_all)  # [N, rho_u_dim]
 
         # --- rho_r: sum of radial basis over neighbors ---
         rho_r = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
         if n_edges > 0:
-            rho_r.scatter_add_(0, full_src.unsqueeze(-1).expand_as(f_all), f_all)
+            rho_r.index_add_(0, full_src, f_all)
 
         # --- Magnetic dot products per edge ---
         m_dst = mag[full_dst]  # [2E, 3]
@@ -352,31 +307,19 @@ class InvariantDescriptorBuilder(nn.Module):
         # --- rho_uj: sum f(r) * u_j ---
         rho_uj = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
         if n_edges > 0:
-            rho_uj.scatter_add_(
-                0,
-                full_src.unsqueeze(-1).expand_as(f_all),
-                f_all * u_dst.unsqueeze(-1),
-            )
+            rho_uj.index_add_(0, full_src, f_all * u_dst.unsqueeze(-1))
 
         # --- rho_s: sum f(r) * s_ij ---
         rho_s = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
         if n_edges > 0:
-            rho_s.scatter_add_(
-                0,
-                full_src.unsqueeze(-1).expand_as(f_all),
-                f_all * s_edge.unsqueeze(-1),
-            )
+            rho_s.index_add_(0, full_src, f_all * s_edge.unsqueeze(-1))
 
         # --- rho_s2 (optional) ---
         rho_s2 = None
         if self.include_s2:
             rho_s2 = torch.zeros(n_atoms, self.num_radial, device=device, dtype=pos.dtype)
             if n_edges > 0:
-                rho_s2.scatter_add_(
-                    0,
-                    full_src.unsqueeze(-1).expand_as(f_all),
-                    f_all * s2_edge.unsqueeze(-1),
-                )
+                rho_s2.index_add_(0, full_src, f_all * s2_edge.unsqueeze(-1))
 
         # --- Angular channels: build triplet indices ---
         R = self.num_radial
@@ -401,29 +344,28 @@ class InvariantDescriptorBuilder(nn.Module):
                 f_j = f_all[ej]  # [T, R]
                 f_k = f_all[ek]  # [T, R]
 
-                # pair = f_j ⊗ f_k + f_k ⊗ f_j  -> [T, R, R]
-                pair = f_j.unsqueeze(-1) * f_k.unsqueeze(1) + f_k.unsqueeze(-1) * f_j.unsqueeze(1)
-
-                # geom = pair * p_l -> [T, R, R, L]
-                geom = pair.unsqueeze(-1) * p_l.unsqueeze(1).unsqueeze(1)
-                geom_flat = geom.reshape(geom.shape[0], -1)  # [T, R*R*L]
+                # pair_flat: [T, R*R], then outer with P_l => [T, R*R*L]
+                pair_flat = (
+                    f_j.unsqueeze(-1) * f_k.unsqueeze(1)
+                    + f_k.unsqueeze(-1) * f_j.unsqueeze(1)
+                ).reshape(f_j.shape[0], -1)
+                geom_flat = torch.einsum("tp,tl->tpl", pair_flat, p_l).reshape(pair_flat.shape[0], -1)
 
                 # A_rr
-                tc_expand = triplet_center.unsqueeze(-1).expand_as(geom_flat)
-                a_rr.scatter_add_(0, tc_expand, geom_flat)
+                a_rr.index_add_(0, triplet_center, geom_flat)
 
                 # A_jk: weight by m_j . m_k
                 dst_j = full_dst[ej]
                 dst_k = full_dst[ek]
                 q_jk = (mag[dst_j] * mag[dst_k]).sum(dim=-1)  # [T]
-                a_jk.scatter_add_(0, tc_expand, geom_flat * q_jk.unsqueeze(-1))
+                a_jk.index_add_(0, triplet_center, geom_flat * q_jk.unsqueeze(-1))
 
                 # A_imm: weight by s_ij * s_ik
                 if self.include_imm:
                     s_j = s_edge[ej]  # [T]
                     s_k = s_edge[ek]  # [T]
                     p_ijk = s_j * s_k
-                    a_imm.scatter_add_(0, tc_expand, geom_flat * p_ijk.unsqueeze(-1))
+                    a_imm.index_add_(0, triplet_center, geom_flat * p_ijk.unsqueeze(-1))
 
         # --- Assemble outputs ---
         desc_parts = [rho_u, rho_r, a_rr, rho_uj, rho_s]
