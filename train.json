@@ -41,6 +41,7 @@
     "pin_memory": true,  // CUDA 训练时建议开启，可减少 H2D 拷贝等待
     "persistent_workers": true,  // num_workers>0 时保留 worker，减少每个 epoch 重启开销
     "prefetch_factor": 2,  // 每个 worker 预取 batch 数；仅在 num_workers>0 时生效
+    "log_interval_batches": 200,  // 每多少个 batch 打印一次进度（<=0 表示关闭）
     "energy_per_atom": true  // 能量损失是否按每原子归一化（推荐 true，减少 Fe16/Fe32 尺度差异）
   },
 

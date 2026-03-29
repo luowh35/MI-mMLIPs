@@ -10,7 +10,7 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -254,10 +254,22 @@ def resolve_energy_center_per_atom(train_ds) -> float:
 
     sum_energy = 0.0
     sum_atoms = 0
-    for i in range(len(train_ds)):
-        sample = train_ds[i]
-        sum_energy += float(sample["energy"])
-        sum_atoms += int(sample["pos"].shape[0])
+    if isinstance(train_ds, ExtXYZDataset):
+        frames = train_ds.frames
+        for frame in frames:
+            sum_energy += float(frame.energy)
+            sum_atoms += int(frame.pos.shape[0])
+    elif isinstance(train_ds, Subset) and isinstance(train_ds.dataset, ExtXYZDataset):
+        base = train_ds.dataset
+        for idx in train_ds.indices:
+            frame = base.frames[int(idx)]
+            sum_energy += float(frame.energy)
+            sum_atoms += int(frame.pos.shape[0])
+    else:
+        for i in range(len(train_ds)):
+            sample = train_ds[i]
+            sum_energy += float(sample["energy"])
+            sum_atoms += int(sample["pos"].shape[0])
 
     if sum_atoms <= 0:
         raise ValueError("Invalid atom count while estimating energy center.")
@@ -269,10 +281,19 @@ def resolve_m_stat(train_ds, mode: str = "mean", quantile: float = 0.5) -> float
         raise ValueError("Training dataset is empty; cannot estimate m_stat.")
 
     norms = []
-    for i in range(len(train_ds)):
-        sample = train_ds[i]
-        mag = sample["mag"]
-        norms.append(torch.linalg.norm(mag, dim=-1).detach().cpu().numpy())
+    if isinstance(train_ds, ExtXYZDataset):
+        for frame in train_ds.frames:
+            norms.append(np.linalg.norm(frame.mag, axis=-1))
+    elif isinstance(train_ds, Subset) and isinstance(train_ds.dataset, ExtXYZDataset):
+        base = train_ds.dataset
+        for idx in train_ds.indices:
+            frame = base.frames[int(idx)]
+            norms.append(np.linalg.norm(frame.mag, axis=-1))
+    else:
+        for i in range(len(train_ds)):
+            sample = train_ds[i]
+            mag = sample["mag"]
+            norms.append(torch.linalg.norm(mag, dim=-1).detach().cpu().numpy())
 
     values = np.concatenate(norms, axis=0)
     if values.size == 0:
@@ -353,6 +374,8 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     cfg: Dict[str, Any],
+    epoch: int | None = None,
+    phase: str = "train",
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     is_train = optimizer is not None
     if is_train:
@@ -372,6 +395,8 @@ def run_epoch(
         "loss_g_rmse": 0.0,
     }
     n_batches = 0
+    n_total_batches = len(loader)
+    log_interval = int(cfg["training"].get("log_interval_batches", 200))
     timing = {
         "data_wait_s": 0.0,
         "predict_total_s": 0.0,
@@ -434,6 +459,25 @@ def run_epoch(
         for k in sums:
             sums[k] += metrics[k]
         n_batches += 1
+
+        if log_interval > 0 and ((n_batches % log_interval == 0) or (n_batches == n_total_batches)):
+            elapsed = (
+                timing["data_wait_s"]
+                + timing["predict_total_s"]
+                + timing["loss_s"]
+                + timing["backward_step_s"]
+            )
+            prefix = f"[progress] phase={phase}"
+            if epoch is not None:
+                prefix = f"[progress] epoch={epoch:03d} phase={phase}"
+            print(
+                f"{prefix} "
+                f"batch={n_batches}/{n_total_batches} "
+                f"elapsed={elapsed:.1f}s "
+                f"data_wait={timing['data_wait_s']:.1f}s "
+                f"desc={timing['descriptor_s']:.1f}s "
+                f"bwd={timing['backward_step_s']:.1f}s"
+            )
         iter_t0 = time.perf_counter()
 
     if n_batches == 0:
@@ -469,28 +513,37 @@ def main() -> None:
     if runtime_device == "cuda" and device.type != "cuda":
         print("[warn] CUDA requested but unavailable, using CPU.")
 
+    t_build_ds0 = time.perf_counter()
     train_ds, val_ds = build_datasets(cfg)
+    t_build_ds = time.perf_counter() - t_build_ds0
     print(
         "[info] dataset split mode: "
         f"{cfg['data']['split_mode']} (train={len(train_ds)}, val={len(val_ds)})"
     )
+    print(f"[info] dataset build/split time: {t_build_ds:.2f}s")
 
     if cfg["model"]["u_norm_mode"] in {"dataset", "dual"} and cfg["model"]["m_stat"] is None:
+        t_m_stat0 = time.perf_counter()
         cfg["model"]["m_stat"] = resolve_m_stat(
             train_ds,
             mode=cfg["model"]["m_stat_mode"],
             quantile=cfg["model"]["m_stat_quantile"],
         )
+        t_m_stat = time.perf_counter() - t_m_stat0
         print(
             "[info] magnetic norm scale m_stat estimated from training set: "
             f"{cfg['model']['m_stat']:.8f} (mode={cfg['model']['m_stat_mode']})"
         )
+        print(f"[info] m_stat estimation time: {t_m_stat:.2f}s")
 
+    t_center0 = time.perf_counter()
     cfg["training"]["energy_center_per_atom"] = resolve_energy_center_per_atom(train_ds)
+    t_center = time.perf_counter() - t_center0
     print(
         "[info] energy center (per atom) estimated from training set: "
         f"{cfg['training']['energy_center_per_atom']:.8f}"
     )
+    print(f"[info] energy center estimation time: {t_center:.2f}s")
     num_workers = int(cfg["training"]["num_workers"])
     pin_memory = bool(cfg["training"].get("pin_memory", True)) and device.type == "cuda"
     persistent_workers = bool(cfg["training"].get("persistent_workers", True)) and num_workers > 0
@@ -562,6 +615,8 @@ def main() -> None:
                 device=device,
                 optimizer=optimizer,
                 cfg=cfg,
+                epoch=epoch,
+                phase="train",
             )
             val_metrics, val_timing = run_epoch(
                 loader=val_loader,
@@ -570,6 +625,8 @@ def main() -> None:
                 device=device,
                 optimizer=None,
                 cfg=cfg,
+                epoch=epoch,
+                phase="val",
             )
             dt = time.time() - t0
 

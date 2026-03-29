@@ -41,6 +41,7 @@ Key updates in config:
 
 Training now prints timing terms such as `train_data_wait`, `train_desc`, `train_model`, `train_bwd`,
 and writes detailed timing dictionaries into `runs/.../metrics.jsonl`.
+For long runs, progress is printed every `log_interval_batches` (see `training.log_interval_batches`).
 
 ## 2) Scan fixed-structure E(m) curve
 
