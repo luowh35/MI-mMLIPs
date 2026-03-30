@@ -397,7 +397,7 @@ def run_epoch(
     epoch: int | None = None,
     phase: str = "train",
     max_batches: int | None = None,
-    scaler: torch.cuda.amp.GradScaler | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     is_train = optimizer is not None
     use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
@@ -461,30 +461,17 @@ def run_epoch(
         pred_t0 = time.perf_counter()
         pred_profile: Dict[str, float] = {}
 
-        # Use autocast for mixed precision if enabled
-        if use_amp and is_train:
-            with torch.cuda.amp.autocast():
-                pred_energy, pred_forces, pred_mag_grad = predict_batch(
-                    model=model,
-                    descriptor_builder=descriptor,
-                    batch=batch,
-                    device=device,
-                    create_graph=is_train,
-                    need_force_grad=use_force_loss,
-                    need_mag_grad=need_mag_grad,
-                    profile=pred_profile,
-                )
-        else:
-            pred_energy, pred_forces, pred_mag_grad = predict_batch(
-                model=model,
-                descriptor_builder=descriptor,
-                batch=batch,
-                device=device,
-                create_graph=is_train,
-                need_force_grad=use_force_loss,
-                need_mag_grad=need_mag_grad,
-                profile=pred_profile,
-            )
+        pred_energy, pred_forces, pred_mag_grad = predict_batch(
+            model=model,
+            descriptor_builder=descriptor,
+            batch=batch,
+            device=device,
+            create_graph=is_train,
+            need_force_grad=use_force_loss,
+            need_mag_grad=need_mag_grad,
+            profile=pred_profile,
+            use_amp=use_amp,
+        )
 
         timing["predict_total_s"] += time.perf_counter() - pred_t0
         timing["descriptor_s"] += pred_profile.get("descriptor_s", 0.0)
@@ -499,29 +486,16 @@ def run_epoch(
                 pred_mag_grad = pred_mag_grad.detach()
 
         loss_t0 = time.perf_counter()
-        if use_amp and is_train:
-            with torch.cuda.amp.autocast():
-                loss, metrics = compute_losses(
-                    batch=batch,
-                    pred_energy=pred_energy,
-                    pred_forces=pred_forces,
-                    pred_mag_grad=pred_mag_grad,
-                    device=device,
-                    cfg=cfg,
-                    use_force_loss=use_force_loss,
-                    use_mag_loss=use_mag_loss,
-                )
-        else:
-            loss, metrics = compute_losses(
-                batch=batch,
-                pred_energy=pred_energy,
-                pred_forces=pred_forces,
-                pred_mag_grad=pred_mag_grad,
-                device=device,
-                cfg=cfg,
-                use_force_loss=use_force_loss,
-                use_mag_loss=use_mag_loss,
-            )
+        loss, metrics = compute_losses(
+            batch=batch,
+            pred_energy=pred_energy,
+            pred_forces=pred_forces,
+            pred_mag_grad=pred_mag_grad,
+            device=device,
+            cfg=cfg,
+            use_force_loss=use_force_loss,
+            use_mag_loss=use_mag_loss,
+        )
         timing["loss_s"] += time.perf_counter() - loss_t0
 
         if is_train:
@@ -688,7 +662,7 @@ def main() -> None:
 
     # Create GradScaler for mixed precision training
     use_amp = bool(cfg["training"].get("use_amp", False)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
     if use_amp:
         print("[info] Mixed precision training (AMP) enabled", flush=True)
 

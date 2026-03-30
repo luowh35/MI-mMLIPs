@@ -52,6 +52,7 @@ def predict_batch(
     need_force_grad: bool = True,
     need_mag_grad: bool = True,
     profile: Dict[str, float] | None = None,
+    use_amp: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Predict energies, forces, mag_grad for a flat-batched dict."""
     pos_flat = _to_device_tensor(batch["pos_flat"], device).detach().requires_grad_(True)
@@ -65,6 +66,7 @@ def predict_batch(
     batch_idx = batch["batch_idx"].to(device)
     B = n_atoms.shape[0]
 
+    # Descriptor computation stays in float32 (scatter ops need consistent dtype)
     desc_t0 = time.perf_counter()
     desc_acc_before = profile.get("descriptor_s", 0.0) if profile is not None else 0.0
     if profile is None:
@@ -100,8 +102,13 @@ def predict_batch(
                 time.perf_counter() - desc_t0
             )
 
+    # MLP forward: autocast only here (safe for linear layers)
     model_t0 = time.perf_counter()
-    e_i = model(descriptors)  # [N_total]
+    if use_amp and device.type == "cuda":
+        with torch.amp.autocast("cuda"):
+            e_i = model(descriptors)  # [N_total]
+    else:
+        e_i = model(descriptors)  # [N_total]
 
     # per-frame energies via scatter_add
     energies = torch.zeros(B, device=device, dtype=e_i.dtype)
