@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: mini-magp
+Version: 0.1.0
+Summary: Magnetic machine learning potential with SO(3)_diag invariant descriptors
+Requires-Python: >=3.9
+Requires-Dist: torch>=2.0
+Requires-Dist: numpy>=1.22
+Requires-Dist: ase>=3.22
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"

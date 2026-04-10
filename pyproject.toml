@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-magp"
+version = "0.1.0"
+description = "Magnetic machine learning potential with SO(3)_diag invariant descriptors"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.22",
+    "ase>=3.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+mini-magp = "mini_magp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

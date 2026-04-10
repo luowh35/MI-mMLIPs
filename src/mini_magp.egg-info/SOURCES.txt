@@ -1,0 +1,17 @@
+pyproject.toml
+src/mini_magp/__init__.py
+src/mini_magp/calculator.py
+src/mini_magp/cli.py
+src/mini_magp/data.py
+src/mini_magp/descriptors.py
+src/mini_magp/model.py
+src/mini_magp/radial.py
+src/mini_magp/train.py
+src/mini_magp/utils.py
+src/mini_magp.egg-info/PKG-INFO
+src/mini_magp.egg-info/SOURCES.txt
+src/mini_magp.egg-info/dependency_links.txt
+src/mini_magp.egg-info/entry_points.txt
+src/mini_magp.egg-info/requires.txt
+src/mini_magp.egg-info/top_level.txt
+tests/test_magpot.py

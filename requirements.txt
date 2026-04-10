@@ -1,0 +1,4 @@
+torch>=2.0
+numpy>=1.22
+ase>=3.22
+matplotlib>=3.5
