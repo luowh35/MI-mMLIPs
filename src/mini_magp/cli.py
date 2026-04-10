@@ -23,6 +23,7 @@ from .data import ensure_vector_moments
 TRAIN_DEFAULTS = {
     "data": None,
     "val": None,
+    "val_split": 0.1,
     "epochs": 500,
     "batch_size": 4,
     "lr": 1e-3,
@@ -38,6 +39,7 @@ TRAIN_DEFAULTS = {
     "lambda_f": 10.0,
     "lambda_h": 10.0,
     "auto_weight": True,
+    "early_stop_patience": 100,
     "device": "cuda",
     "output": "best.pt",
     "output_dir": ".",
@@ -104,6 +106,13 @@ def main():
     p_pred.add_argument("--device", default="cuda")
     p_pred.add_argument("--output", default="predictions.xyz", help="Output extxyz")
 
+    # --- export ---
+    p_export = sub.add_parser("export",
+                              help="Export model to TorchScript for LAMMPS")
+    p_export.add_argument("model", help="Path to checkpoint .pt file")
+    p_export.add_argument("output", nargs="?", default=None,
+                          help="Output TorchScript path (default: model_lammps.pt)")
+
     # --- default-config ---
     p_cfg = sub.add_parser("default-config",
                            help="Generate a default config JSON file")
@@ -119,6 +128,8 @@ def main():
         _run_train(args)
     elif args.command == "predict":
         _run_predict(args)
+    elif args.command == "export":
+        _run_export(args)
     elif args.command == "default-config":
         _run_default_config(args)
 
@@ -212,16 +223,18 @@ def _run_train(args):
     if args.val:
         print(f"Loading validation data: {args.val}")
         val_ds = MagneticDataset.from_extxyz(args.val, species_map=species_map)
-    elif len(train_ds) >= 10:
-        # Auto-split: 90% train, 10% val
+    elif args.val_split > 0 and len(train_ds) >= 10:
+        # Auto-split
         from torch.utils.data import random_split
-        n_val = max(1, int(len(train_ds) * 0.1))
+        n_val = max(1, int(len(train_ds) * args.val_split))
         n_train = len(train_ds) - n_val
         train_sub, val_sub = random_split(train_ds, [n_train, n_val])
         all_structures = train_ds.structures
         val_ds = MagneticDataset([all_structures[i] for i in val_sub.indices])
         train_ds = MagneticDataset([all_structures[i] for i in train_sub.indices])
         print(f"Auto-split: {n_train} train, {n_val} val")
+    else:
+        print(f"No validation set. Training on all {len(train_ds)} structures.")
 
     hparams = {
         "r_cutoff": args.r_cutoff,
@@ -237,9 +250,9 @@ def _run_train(args):
     model = MagPot(**hparams)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Fit descriptor scaler on full training set
+    # Fit descriptor scaler on the full training set.
     from .data import collate_magnetic
-    scaler_batch = collate_magnetic([train_ds[i] for i in range(min(len(train_ds), 200))])
+    scaler_batch = collate_magnetic([train_ds[i] for i in range(len(train_ds))])
     model.fit_scaler(
         scaler_batch["positions"], scaler_batch["species"],
         scaler_batch["magnetic_moments"],
@@ -263,6 +276,7 @@ def _run_train(args):
         lambda_f=args.lambda_f,
         lambda_h=args.lambda_h,
         auto_weight=args.auto_weight,
+        early_stop_patience=args.early_stop_patience,
         device=args.device,
         output_path=args.output,
         output_dir=args.output_dir,
@@ -329,8 +343,9 @@ def _run_predict(args):
         positions = torch.tensor(atoms.positions, dtype=torch.float32, device=device)
         species_t = torch.tensor(species, dtype=torch.long, device=device)
 
-        if "magnetic_moments" in atoms.arrays:
-            raw = atoms.arrays["magnetic_moments"]
+        # Support both "magnetic_moments" and "magnetic_moment" keys
+        raw = atoms.arrays.get("magnetic_moments") or atoms.arrays.get("magnetic_moment")
+        if raw is not None:
             mag = torch.tensor(
                 ensure_vector_moments(raw, len(atoms)),
                 dtype=torch.float32, device=device,
@@ -375,6 +390,16 @@ def _run_predict(args):
 
     ase_write(args.output, results)
     print(f"Predictions written to {args.output} ({len(results)} structures)")
+
+
+def _run_export(args):
+    from .export import export_model
+
+    output = args.output
+    if output is None:
+        output = os.path.splitext(args.model)[0] + "_lammps.pt"
+
+    export_model(args.model, output)
 
 
 def _run_default_config(args):

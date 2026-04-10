@@ -1,0 +1,182 @@
+LAMMPS (2 Aug 2023 - Update 3)
+# LAMMPS input script for CrI3 spin dynamics - Temperature cooling simulation
+# CrI3 Curie temperature: ~45K (monolayer), ~61K (bulk)
+#
+# Simulation protocol:
+# - Start from high-temperature disordered state
+# - Gradually cool down to observe magnetic ordering
+# - At each temperature: 100,000 steps, average over last 25,000 steps
+# - Damping = 0.1, timestep = 1.0 fs
+
+units           metal
+atom_style      spin
+atom_modify     map array
+boundary        p p p
+newton          on
+
+# Read initial structure
+read_data       Cri3-Times20.data
+Reading data file ...
+  triclinic box = (0 0 0) to (139.37097 120.69879 20.755856) with tilt (-69.685502 0 0)
+WARNING: Triclinic box skew is large. LAMMPS will run inefficiently. (../domain.cpp:220)
+  1 by 1 by 1 MPI processor grid
+  reading atoms ...
+  3200 atoms
+  read_data CPU = 0.005 seconds
+
+# Define NEP-SPIN pair style
+pair_style      spin/minip
+SPIN-MINIP: 1 GPU(s) detected, using GPU 0
+pair_coeff      * * ../spin-minip.pt Cr I
+SPIN-MINIP: r_cutoff=4.699999809265137, num_species=2
+SPIN-MINIP: project_target_mag_force=true
+SPIN-MINIP: Model loaded from ../spin-minip.pt
+SPIN-MINIP: r_cutoff = 4.699999809265137 Angstrom
+SPIN-MINIP: Elements: Cr I
+
+# Neighbor settings
+neighbor        1 bin
+neigh_modify    delay 0 every 10 check yes
+
+# Create group for magnetic atoms only (Cr)
+group           magnetic type 1
+800 atoms in group magnetic
+
+# ============================================
+# Simulation parameters
+# ============================================
+variable        damping1 equal 0.5           # Gilbert damping coefficient
+variable        damping2 equal 0.02
+variable        dt equal 0.001              # Timestep: 1.0 fs = 0.001 ps
+variable        seed equal 12345            # Random seed
+
+# Steps per temperature
+variable        nsteps equal  10000         # Total steps at each temperature
+variable        nequil1 equal 10000          # Equilibration steps (first 3/4)
+variable        nequil2 equal 10000
+# Temperature range (high to low for cooling)
+# ============================================
+compute         sp_prop all property/atom sp spx spy spz
+compute         mag_x magnetic reduce ave c_sp_prop[2]
+compute         mag_y magnetic reduce ave c_sp_prop[3]
+compute         mag_z magnetic reduce ave c_sp_prop[4]
+
+set             group magnetic spin/random ${seed} 3
+set             group magnetic spin/random 12345 3
+Setting atom values ...
+WARNING: Set attribute spin/random is deprecated. Please use spin/atom/random instead. (../set.cpp:305)
+  800 settings made for spin/random
+# Total magnetization magnitude
+variable        mag_total equal sqrt(c_mag_x^2+c_mag_y^2+c_mag_z^2)
+
+# ============================================
+# Output settings
+# ============================================
+thermo_style    custom step temp pe etotal c_mag_x c_mag_y c_mag_z v_mag_total
+thermo          10
+
+# Dump trajectory
+#
+#dump            spin_dump magnetic custom 10 spin_dynamics.dump id type x y z c_sp_prop[1] c_sp_prop[2] c_sp_prop[3] c_sp_prop[4]
+
+min_style spin/lbfgs
+min_modify line spin_cubic
+minimize 0 1e-6 10000 10000
+
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
+
+Your simulation uses code contributions which should be cited:
+
+- min_style spin/lbfgs command: doi:10.48550/arXiv.1904.02669
+
+@article{ivanov2019fast,
+title={Fast and Robust Algorithm for the Minimisation of the Energy of
+    Spin Systems},
+author={Ivanov, A. V and Uzdin, V. M. and J{'o}nsson, H.},
+journal={arXiv preprint arXiv:1904.02669},
+year={2019}
+}
+
+CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
+
+Switching to 'neigh_modify every 1 delay 0 check yes' setting during minimization
+WARNING: Line search incompatible with gneb (../min_spin_lbfgs.cpp:108)
+WARNING: Using spin pair style without nve/spin (../pair_spin_minip.cpp:373)
+Neighbor list info ...
+  update: every = 1 steps, delay = 0 steps, check = yes
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 5.6999998
+  ghost atom cutoff = 5.6999998
+  binsize = 2.8499999, bins = 74 43 8
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair spin/minip, perpetual
+      attributes: full, newton on, ghost
+      pair build: full/bin/ghost
+      stencil: full/ghost/bin/3d
+      bin: standard
+Per MPI rank memory allocation (min/avg/max) = 5.274 | 5.274 | 5.274 Mbytes
+   Step          Temp          PotEng         TotEng        c_mag_x        c_mag_y        c_mag_z      v_mag_total  
+         0   0             -12302.697     -12302.697     -0.017014337   -0.013518521    0.015027423    0.026420854  
+        10   0             -12311.268     -12311.268      0.09828307     0.015660826    0.095934377    0.13823251   
+        20   0             -12312.211     -12312.211      0.36848691     0.0086967398   0.057409984    0.3730337    
+        30   0             -12312.434     -12312.434      0.70320921    -0.11550578    -0.042021406    0.71387014   
+        40   0             -12312.541     -12312.541      0.91224184    -0.18028786    -0.048783906    0.93116527   
+        50   0             -12312.559     -12312.559      0.97384216    -0.2097034     -0.033366111    0.99672331   
+        60   0             -12312.561     -12312.561      0.97208053    -0.23030484    -0.034590446    0.9995886    
+        70   0             -12312.561     -12312.561      0.96586957    -0.25514354    -0.033034667    0.99954667   
+        80   0             -12312.562     -12312.562      0.92220252    -0.38477911    -0.015103969    0.9993701    
+        90   0             -12312.562     -12312.562      0.87129281    -0.48986761    -0.0008651456   0.999561     
+       100   0             -12312.562     -12312.562      0.85949659    -0.51036386     0.0015277948   0.99960392   
+       110   0             -12312.562     -12312.562      0.8574216     -0.5138527      0.0020367328   0.9996102    
+       120   0             -12312.562     -12312.562      0.8573405     -0.51398834     0.002103397    0.99961051   
+       130   0             -12312.562     -12312.562      0.85750186    -0.51371953     0.0020457346   0.99961062   
+       140   0             -12312.562     -12312.562      0.85786936    -0.51310584     0.0019722948   0.99961059   
+       150   0             -12312.562     -12312.562      0.8581418     -0.51265037     0.0019063939   0.99961062   
+       160   0             -12312.562     -12312.562      0.85821582    -0.51252648     0.0018817748   0.99961059   
+       170   0             -12312.562     -12312.562      0.85835658    -0.51229081     0.0018497837   0.99961058   
+       180   0             -12312.562     -12312.562      0.8586792     -0.51175013     0.0017872008   0.99961061   
+       190   0             -12312.562     -12312.562      0.85878349    -0.5115752      0.0017506167   0.99961059   
+       193   0             -12312.562     -12312.562      0.85878391    -0.5115745      0.0017503165   0.99961059   
+Loop time of 4.86994 on 1 procs for 193 steps with 3200 atoms
+
+389.7% CPU use with 1 MPI tasks x no OpenMP threads
+
+Minimization stats:
+  Stopping criterion = force tolerance
+  Energy initial, next-to-last, final = 
+      -12302.697265625        -12312.5625        -12312.5625
+  Force two-norm initial, final = 1.8666445 1.565384
+  Force max component initial, final = 0.063428134 0.032857347
+  Final line search alpha, max atom move = 0 0
+  Iterations, force evaluations = 193 197
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 4.8193     | 4.8193     | 4.8193     |   0.0 | 98.96
+Neigh   | 0          | 0          | 0          |   0.0 |  0.00
+Comm    | 0.0096332  | 0.0096332  | 0.0096332  |   0.0 |  0.20
+Output  | 0.0016365  | 0.0016365  | 0.0016365  |   0.0 |  0.03
+Modify  | 0          | 0          | 0          |   0.0 |  0.00
+Other   |            | 0.03941    |            |       |  0.81
+
+Nlocal:           3200 ave        3200 max        3200 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:           2124 ave        2124 max        2124 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:              0 ave           0 max           0 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+FullNghs:        48000 ave       48000 max       48000 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 48000
+Ave neighs/atom = 15
+Neighbor list builds = 0
+Dangerous builds = 0
+
+#fix frlx all box/relax tri 0.0
+#min_style cg
+write_data      spin_dynamics_cooled.data
+System init for write_data ...
+WARNING: Using spin pair style without nve/spin (../pair_spin_minip.cpp:373)
+Total wall time: 0:00:05

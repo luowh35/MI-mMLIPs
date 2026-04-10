@@ -1,7 +1,8 @@
 {
     "data": "cri3_900.xyz",
     "val": null,
-    "epochs": 1000,
+    "val_split": 0,
+    "epochs": 500,
     "batch_size": 4,
     "lr": 0.001,
     "r_cutoff": 4.7,
@@ -14,12 +15,13 @@
     "num_layers_mag": 3,
     "auto_weight": false,
     "lambda_e": 100.0,
-    "lambda_f": 5,
-    "lambda_h": 500.0,
+    "lambda_f": 1,
+    "lambda_h": 10.0,
     "device": "cuda",
     "output": "best.pt",
     "output_dir": ".",
     "predict_interval": 10,
     "species_map": {"Cr": 0, "I": 1},
-    "magnetic_species": ["Cr"]
+    "magnetic_species": ["Cr"],
+    "early_stop_patience": 300
 }

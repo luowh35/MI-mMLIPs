@@ -1,13 +1,16 @@
 """
 Magnetic descriptor computation for MagPot.
 
-Implements the 6 descriptor sectors from the minimal generator framework:
+Implements 9 descriptor sectors:
 1. Amplitude (u_i, u_i^2, u_i^3)
 2. Isotropic exchange (m_i · M_n)
 3. Single-ion anisotropy (m_i · Q_n · m_i)
 4. Symmetric anisotropic exchange (m_i · Q_m · M_n)
 5. DMI (A_nm · (m_i × M_m))
 6. Amplitude-mixed (u_i × sectors 2,3,5)
+7. Neighbor amplitude (Σ_j φ_n u_j)
+8. Neighbor-amplitude exchange (m_i · Σ_j φ_n u_j m_j)
+9. Neighbor-amplitude mixed (u_i × sector 8)
 
 All operations preserve the PyTorch computation graph for autograd.
 """
@@ -243,7 +246,7 @@ def descriptor_angular_l2(
 def compute_covariants(
     edge_index: Tensor,
     r_ij: Tensor,
-    magnetic_moments: Tensor,
+    spin_vectors: Tensor,
     phi: Tensor,
     num_atoms: int,
 ) -> Dict[str, Tensor]:
@@ -252,13 +255,16 @@ def compute_covariants(
     Args:
         edge_index: [2, num_edges], (i, j) pairs
         r_ij: [num_edges, 3], displacement vectors
-        magnetic_moments: [num_atoms, 3]
+        spin_vectors: [num_atoms, 3]
+            Spin-like vectors used for directional sectors. In the minimal
+            generator construction this should be the unit spin direction
+            rather than the raw magnetic moment, so amplitude is handled only
+            by sector 1 and sector 6.
         phi: [num_edges, n_max], radial basis values
         num_atoms: total number of atoms
 
     Returns:
         Dictionary with covariant tensors:
-        - 'u': [num_atoms], magnetic moment magnitude squared
         - 'M': [num_atoms, n_max, 3], neighbor magnetic moment channel
         - 'Q': [num_atoms, n_max, 3, 3], geometric 2nd-rank tensor
         - 'A': [num_atoms, n_max, n_max, 3], axial vector channel
@@ -270,10 +276,7 @@ def compute_covariants(
     device = r_ij.device
     dtype = r_ij.dtype
 
-    m = magnetic_moments  # [num_atoms, 3]
-
-    # u_i = |m_i|^2
-    u = (m * m).sum(dim=-1)  # [num_atoms]
+    m = spin_vectors  # [num_atoms, 3]
 
     # Neighbor magnetic moments
     m_j = m[j_idx]  # [num_edges, 3]
@@ -297,7 +300,7 @@ def compute_covariants(
     # Direct double sum over neighbor pairs per center atom.
     A = _compute_A_nm(i_idx, r_ij, phi, num_atoms, n_max, device, dtype)
 
-    return {"u": u, "M": M, "Q": Q, "A": A}
+    return {"M": M, "Q": Q, "A": A}
 
 
 def descriptor_amplitude(u: Tensor) -> Tensor:
@@ -417,6 +420,16 @@ def descriptor_amplitude_mixed(
     return torch.cat([u_col * d_iso, u_col * d_sia, u_col * d_dmi], dim=-1)
 
 
+def descriptor_neighbor_amplitude(U: Tensor) -> Tensor:
+    """Sector 7: Neighbor amplitude descriptors Σ_j φ_n(r_ij) u_j."""
+    return U
+
+
+def descriptor_neighbor_amplitude_exchange(m: Tensor, W: Tensor) -> Tensor:
+    """Sector 8: Neighbor-amplitude exchange m_i · Σ_j φ_n u_j m_j."""
+    return (m.unsqueeze(1) * W).sum(dim=-1)
+
+
 def compute_all_descriptors(
     edge_index: Tensor,
     r_ij: Tensor,
@@ -424,7 +437,12 @@ def compute_all_descriptors(
     phi: Tensor,
     num_atoms: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Compute structural and magnetic descriptor vectors for all atoms.
+    """Compute structural and magnetic descriptor vectors.
+
+    Magnetic descriptors separate amplitude and direction:
+    sector 1 uses u = |m|², sectors 2-5 use the unit spin direction, sector 6
+    mixes u back into the directional sectors, and sectors 7-9 add explicit
+    neighbor-amplitude coupling for variable-spin systems such as Fe.
 
     Args:
         edge_index: [2, num_edges]
@@ -435,8 +453,8 @@ def compute_all_descriptors(
 
     Returns:
         (desc_struct, desc_mag):
-            desc_struct: [num_atoms, struct_dim]  — no m dependence
-            desc_mag:    [num_atoms, mag_dim]     — depends on m
+            desc_struct:  [num_atoms, struct_dim]  — no m dependence
+            desc_mag:     [num_atoms, mag_dim]     — all 9 sectors
     """
     i_idx = edge_index[0]
 
@@ -447,21 +465,57 @@ def compute_all_descriptors(
     desc_struct = torch.cat([d_radial, d_ang_l1, d_ang_l2], dim=-1)
 
     # --- Magnetic descriptors ---
-    cov = compute_covariants(edge_index, r_ij, magnetic_moments, phi, num_atoms)
-
+    #
+    # The minimal-generator construction treats amplitude and direction
+    # separately: sectors 2-5 should depend on unit spin directions only,
+    # while sector 1 and sector 6 carry amplitude information via u = |m|².
     m = magnetic_moments
-    u = cov["u"]
+    u = (m * m).sum(dim=-1)
+    m_norm = m.norm(dim=-1, keepdim=True)
+    m_dir = m / m_norm.clamp(min=1e-8)
+    m_dir = torch.where(m_norm > 1e-8, m_dir, torch.zeros_like(m_dir))
+
+    cov = compute_covariants(edge_index, r_ij, m_dir, phi, num_atoms)
+
     M = cov["M"]
     Q = cov["Q"]
     A = cov["A"]
 
     d_amp = descriptor_amplitude(u)
-    d_iso = descriptor_isotropic_exchange(m, M)
-    d_sia = descriptor_sia(m, Q)
-    d_sae = descriptor_sae(m, Q, M)
-    d_dmi = descriptor_dmi(m, M, A)
-    d_mix = descriptor_amplitude_mixed(u, d_iso, d_sia, d_dmi)
-    desc_mag = torch.cat([d_amp, d_iso, d_sia, d_sae, d_dmi, d_mix], dim=-1)
+    d_iso = descriptor_isotropic_exchange(m_dir, M)
+    d_sia = descriptor_sia(m_dir, Q)
+    d_sae = descriptor_sae(m_dir, Q, M)
+    d_dmi = descriptor_dmi(m_dir, M, A)
+    d_amp_mix = descriptor_amplitude_mixed(u, d_iso, d_sia, d_dmi)
+
+    # Neighbor-amplitude coupling sectors.
+    i_idx, j_idx = edge_index
+    u_j = u[j_idx]
+    d_nbr_amp = descriptor_neighbor_amplitude(
+        _scatter_add(phi * u_j.unsqueeze(-1), i_idx, 0, num_atoms)
+    )
+    weighted_u_m = (
+        phi.unsqueeze(-1)
+        * (u_j.unsqueeze(-1) * m_dir[j_idx]).unsqueeze(1)
+    )
+    W = _scatter_add(weighted_u_m, i_idx, 0, num_atoms)
+    d_nbr_amp_ex = descriptor_neighbor_amplitude_exchange(m_dir, W)
+    d_nbr_amp_ex_mix = u.unsqueeze(-1) * d_nbr_amp_ex
+
+    desc_mag = torch.cat(
+        [
+            d_amp,
+            d_iso,
+            d_sia,
+            d_sae,
+            d_dmi,
+            d_amp_mix,
+            d_nbr_amp,
+            d_nbr_amp_ex,
+            d_nbr_amp_ex_mix,
+        ],
+        dim=-1,
+    )
 
     return desc_struct, desc_mag
 
@@ -479,11 +533,45 @@ def get_struct_descriptor_dim(n_max: int) -> int:
 
 
 def get_mag_descriptor_dim(n_max: int) -> int:
-    """Magnetic descriptor dimension (depends on m)."""
+    """Magnetic descriptor dimension (all 9 sectors)."""
     d_amp = 3
     d_iso = n_max
     d_sia = n_max
     d_sae = n_max * n_max
     d_dmi = n_max * n_max
-    d_mix = n_max + n_max + n_max * n_max
-    return d_amp + d_iso + d_sia + d_sae + d_dmi + d_mix
+    d_amp_mix = n_max + n_max + n_max * n_max  # u*iso + u*sia + u*dmi
+    d_nbr_amp = n_max
+    d_nbr_amp_ex = n_max
+    d_nbr_amp_ex_mix = n_max
+    return (
+        d_amp
+        + d_iso
+        + d_sia
+        + d_sae
+        + d_dmi
+        + d_amp_mix
+        + d_nbr_amp
+        + d_nbr_amp_ex
+        + d_nbr_amp_ex_mix
+    )
+
+
+def get_mag_sector_dims(n_max: int) -> list:
+    """Return per-sector descriptor dimensions in concat order.
+
+    Order:
+    [amplitude, iso_exchange, sia, sae, dmi, amp_mixed,
+     neighbor_amp, neighbor_amp_exchange, neighbor_amp_exchange_mixed]
+    Used for per-sector normalization in the model.
+    """
+    return [
+        3,                              # amplitude: u, u², u³
+        n_max,                          # isotropic exchange
+        n_max,                          # SIA
+        n_max * n_max,                  # SAE
+        n_max * n_max,                  # DMI
+        n_max + n_max + n_max * n_max,  # amplitude-mixed
+        n_max,                          # neighbor amplitude: Σ_j φ_n u_j
+        n_max,                          # neighbor-amplitude exchange
+        n_max,                          # neighbor-amplitude exchange mixed by u_i
+    ]

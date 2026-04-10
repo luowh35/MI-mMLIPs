@@ -1,0 +1,28 @@
+# LAMMPS input script for CrI3 spin dynamics - Temperature cooling simulation
+# CrI3 Curie temperature: ~45K (monolayer), ~61K (bulk)
+#
+# Simulation protocol:
+# - Start from high-temperature disordered state
+# - Gradually cool down to observe magnetic ordering
+# - At each temperature: 100,000 steps, average over last 25,000 steps
+# - Damping = 0.1, timestep = 1.0 fs
+
+units           metal
+atom_style      spin
+atom_modify     map array
+boundary        p p p
+newton          on
+
+# Read initial structure
+read_data       Cri3-Times20.data
+
+# Define NEP-SPIN pair style
+pair_style      spin/minip
+pair_coeff      * * ../spin-minip.pt Cr I
+
+# Neighbor settings
+neighbor        1 bin
+neigh_modify    delay 0 every 10 check yes
+
+run 0
+# Create group for magnetic atoms only (Cr)

@@ -42,6 +42,7 @@ class Trainer:
         lambda_f: float = 10.0,
         lambda_h: float = 10.0,
         auto_weight: bool = True,
+        early_stop_patience: int = 100,
         device: str = "cuda",
         output_path: str = "best.pt",
         output_dir: str = ".",
@@ -110,6 +111,7 @@ class Trainer:
         self.lambda_f = lambda_f
         self.lambda_h = lambda_h
         self.auto_weight = auto_weight
+        self.early_stop_patience = early_stop_patience
 
         if auto_weight:
             # Compute label scales from training set for loss normalization.
@@ -461,7 +463,7 @@ class Trainer:
 
         best_val_loss = getattr(self, "_resume_best_val", float("inf"))
         no_improve_count = 0
-        early_stop_patience = 100
+        early_stop_patience = self.early_stop_patience
         latest_path = os.path.splitext(self.output_path)[0] + "_latest.pt"
         loss_path = os.path.join(self.output_dir, "loss.out")
 
@@ -531,5 +533,8 @@ class Trainer:
                     print(f"Early stopping at epoch {epoch} (no improvement for {early_stop_patience} epochs)")
                     break
             else:
-                self._save_checkpoint(self.output_path, epoch, best_val_loss)
+                # No validation set: save best by training loss, no early stopping
+                if train_losses["raw_total"] < best_val_loss:
+                    best_val_loss = train_losses["raw_total"]
+                    self._save_checkpoint(self.output_path, epoch, best_val_loss)
                 self._save_checkpoint(latest_path, epoch, best_val_loss)

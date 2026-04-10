@@ -12,8 +12,28 @@ from typing import Optional, Tuple
 import hashlib
 
 from .radial import RadialBasis
-from .descriptors import compute_all_descriptors, get_struct_descriptor_dim, get_mag_descriptor_dim, get_descriptor_dim
+from .descriptors import compute_all_descriptors, get_struct_descriptor_dim, get_mag_descriptor_dim, get_descriptor_dim, get_mag_sector_dims
 from .utils import build_neighbor_list, build_neighbor_topology, rij_from_topology
+
+
+def project_forces_perpendicular(
+    forces: Tensor,
+    magnetic_moments: Tensor,
+    epsilon: float = 1e-12,
+) -> Tensor:
+    """Project magnetic forces onto the plane perpendicular to m.
+
+    Constrained-spin datasets store the physically relevant torque-like
+    component only. Matching that convention avoids learning spurious
+    longitudinal gradients with respect to |m|.
+    """
+    if magnetic_moments.dim() == 1:
+        return forces
+
+    m_norm = magnetic_moments.norm(dim=-1, keepdim=True).clamp(min=epsilon)
+    m_unit = magnetic_moments / m_norm
+    f_parallel = (forces * m_unit).sum(dim=-1, keepdim=True) * m_unit
+    return forces - f_parallel
 
 
 class MagPot(nn.Module):
@@ -63,6 +83,7 @@ class MagPot(nn.Module):
         # Descriptor dimensions
         self.struct_dim = get_struct_descriptor_dim(n_max)
         self.mag_dim = get_mag_descriptor_dim(n_max)
+        self.mag_sector_dims = get_mag_sector_dims(n_max)
         self.descriptor_dim = self.struct_dim + self.mag_dim
 
         # Species embedding (shared)
@@ -97,7 +118,7 @@ class MagPot(nn.Module):
         self.hidden_dim_mag = h_mag
         self.num_layers_mag = n_mag
 
-        # Descriptor scalers (separate for struct and mag)
+        # Descriptor scalers — magnetic uses per-sector normalization
         self.register_buffer("struct_shift", torch.zeros(self.struct_dim))
         self.register_buffer("struct_scale", torch.ones(self.struct_dim))
         self.register_buffer("mag_shift", torch.zeros(self.mag_dim))
@@ -166,12 +187,12 @@ class MagPot(nn.Module):
         dist = r_ij.norm(dim=-1)
         phi = self.radial_basis(dist, species[i_idx], species[j_idx])
 
-        # 3. Descriptors (structural + magnetic, separate tensors)
+        # 3. Descriptors (structural + magnetic)
         desc_struct, desc_mag = compute_all_descriptors(
             edge_index, r_ij, magnetic_moments, phi, num_atoms
         )
 
-        # 4. Scale descriptors
+        # 4. Scale descriptors (per-sector for magnetic)
         if self._scaler_fitted:
             desc_struct = (desc_struct - self.struct_shift) * self.struct_scale
             desc_mag = (desc_mag - self.mag_shift) * self.mag_scale
@@ -179,9 +200,10 @@ class MagPot(nn.Module):
         # 5. Species embedding (shared)
         embed = self.species_embedding(species)
 
-        # 6. Dual NN: E = E_struct + E_mag + e0[species]
+        # 6. Dual-NN: E = E_struct + E_mag + e0[species]
         e_struct = self.nn_struct(torch.cat([desc_struct, embed], dim=-1)).squeeze(-1)
         e_mag = self.nn_mag(torch.cat([desc_mag, embed], dim=-1)).squeeze(-1)
+
         energy_per_atom = e_struct + e_mag + self.atomic_energy_shift[species]
 
         # 7. Sum per structure
@@ -221,9 +243,18 @@ class MagPot(nn.Module):
             std_s = desc_struct.std(dim=0, unbiased=False).clamp(min=1e-6)
             self.struct_scale.copy_(1.0 / std_s)
 
-            self.mag_shift.copy_(desc_mag.mean(dim=0))
-            std_m = desc_mag.std(dim=0, unbiased=False).clamp(min=1e-6)
-            self.mag_scale.copy_(1.0 / std_m)
+            # Per-sector normalization for magnetic descriptors
+            offset = 0
+            mag_shift = torch.zeros(self.mag_dim, device=positions.device, dtype=positions.dtype)
+            mag_scale = torch.ones(self.mag_dim, device=positions.device, dtype=positions.dtype)
+            for sec_dim in self.mag_sector_dims:
+                sec = desc_mag[:, offset:offset + sec_dim]
+                mag_shift[offset:offset + sec_dim] = sec.mean(dim=0)
+                std_sec = sec.std(dim=0, unbiased=False).clamp(min=1e-6)
+                mag_scale[offset:offset + sec_dim] = 1.0 / std_sec
+                offset += sec_dim
+            self.mag_shift.copy_(mag_shift)
+            self.mag_scale.copy_(mag_scale)
 
             # Per-species atomic energy shift via least-squares:
             # E_total = Σ_i e0[species_i] + NN residual
@@ -270,8 +301,9 @@ def compute_forces_and_fields(
     Returns:
         energy: [num_structures]
         forces: [num_atoms, 3], F_i = -dE/dr_i
-        h_eff: H_i = -dE/dm_i. Shape [num_magnetic, 3] if magnetic_mask given,
-               else [num_atoms, 3]. None if compute_heff=False.
+        h_eff: projected magnetic force, i.e. the component of -dE/dm_i
+               perpendicular to m_i. Shape [num_magnetic, 3] if magnetic_mask
+               given, else [num_atoms, 3]. None if compute_heff=False.
     """
     positions = positions.detach().requires_grad_(True)
 
@@ -292,7 +324,7 @@ def compute_forces_and_fields(
             create_graph=model.training,
         )
         forces = -grads[0]
-        h_eff = -grads[1]  # [num_magnetic, 3]
+        h_eff = project_forces_perpendicular(-grads[1], mag_m)  # [num_magnetic, 3]
     elif compute_heff:
         magnetic_moments = magnetic_moments.detach().requires_grad_(True)
         energy = model(positions, species, magnetic_moments, cell, pbc, batch)
@@ -304,7 +336,7 @@ def compute_forces_and_fields(
             create_graph=model.training,
         )
         forces = -grads[0]
-        h_eff = -grads[1]  # [num_atoms, 3]
+        h_eff = project_forces_perpendicular(-grads[1], magnetic_moments)  # [num_atoms, 3]
     else:
         energy = model(positions, species, magnetic_moments, cell, pbc, batch)
         total_energy = energy.sum()

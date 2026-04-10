@@ -4,6 +4,7 @@ src/mini_magp/calculator.py
 src/mini_magp/cli.py
 src/mini_magp/data.py
 src/mini_magp/descriptors.py
+src/mini_magp/export.py
 src/mini_magp/model.py
 src/mini_magp/radial.py
 src/mini_magp/train.py

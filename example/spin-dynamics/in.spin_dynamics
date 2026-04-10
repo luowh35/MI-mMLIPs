@@ -1,0 +1,69 @@
+# LAMMPS input script for CrI3 spin dynamics - Temperature cooling simulation
+# CrI3 Curie temperature: ~45K (monolayer), ~61K (bulk)
+#
+# Simulation protocol:
+# - Start from high-temperature disordered state
+# - Gradually cool down to observe magnetic ordering
+# - At each temperature: 100,000 steps, average over last 25,000 steps
+# - Damping = 0.1, timestep = 1.0 fs
+
+units           metal
+atom_style      spin
+atom_modify     map array
+boundary        p p p
+newton          on
+
+# Read initial structure
+read_data       Cri3-Times20.data
+
+# Define NEP-SPIN pair style
+pair_style      spin/minip
+pair_coeff      * * ../spin-minip.pt Cr I
+
+# Neighbor settings
+neighbor        1 bin
+neigh_modify    delay 0 every 10 check yes
+
+# Create group for magnetic atoms only (Cr)
+group           magnetic type 1
+
+# ============================================
+# Simulation parameters
+# ============================================
+variable        damping1 equal 0.5           # Gilbert damping coefficient
+variable        damping2 equal 0.02
+variable        dt equal 0.001              # Timestep: 1.0 fs = 0.001 ps
+variable        seed equal 12345            # Random seed
+
+# Steps per temperature
+variable        nsteps equal  10000         # Total steps at each temperature
+variable        nequil1 equal 10000          # Equilibration steps (first 3/4)
+variable        nequil2 equal 10000
+# Temperature range (high to low for cooling)
+# ============================================
+compute         sp_prop all property/atom sp spx spy spz
+compute         mag_x magnetic reduce ave c_sp_prop[2]
+compute         mag_y magnetic reduce ave c_sp_prop[3]
+compute         mag_z magnetic reduce ave c_sp_prop[4]
+
+set             group magnetic spin/random ${seed} 3
+# Total magnetization magnitude
+variable        mag_total equal sqrt(c_mag_x^2+c_mag_y^2+c_mag_z^2)
+
+# ============================================
+# Output settings
+# ============================================
+thermo_style    custom step temp pe etotal c_mag_x c_mag_y c_mag_z v_mag_total 
+thermo          10
+
+# Dump trajectory
+#
+#dump            spin_dump magnetic custom 10 spin_dynamics.dump id type x y z c_sp_prop[1] c_sp_prop[2] c_sp_prop[3] c_sp_prop[4]
+
+min_style spin/lbfgs
+min_modify line spin_cubic
+minimize 0 1e-6 10000 10000
+
+#fix frlx all box/relax tri 0.0
+#min_style cg
+write_data      spin_dynamics_cooled.data
