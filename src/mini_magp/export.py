@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import json
-from typing import Tuple
+from typing import List, Tuple
 
 
 # ============================================================================
@@ -289,6 +289,8 @@ class MagPotTorchScript(nn.Module):
         struct_dim: int,
         mag_dim: int,
         species_embed_dim: int = 16,
+        mag_head_mode: str = "monolithic",
+        mag_sector_dims: List[int] | None = None,
     ):
         super().__init__()
         self.r_cutoff = r_cutoff
@@ -297,6 +299,11 @@ class MagPotTorchScript(nn.Module):
         self.num_species = num_species
         self.struct_dim = struct_dim
         self.mag_dim = mag_dim
+        self.use_sector_heads = mag_head_mode == "sector"
+        if mag_sector_dims is None:
+            self.mag_sector_dims = torch.jit.Attribute([], List[int])
+        else:
+            self.mag_sector_dims = torch.jit.Attribute(mag_sector_dims, List[int])
 
         # Radial basis coefficients (will be copied from trained model)
         self.rb_coefficients = nn.Parameter(
@@ -309,6 +316,7 @@ class MagPotTorchScript(nn.Module):
         # Placeholder NNs — will be replaced by copying from trained model
         self.nn_struct = nn.Sequential()
         self.nn_mag = nn.Sequential()
+        self.nn_mag_heads = nn.ModuleList()
 
         # Scaler buffers (magnetic uses per-sector normalization, stored flat)
         self.register_buffer("struct_shift", torch.zeros(struct_dim))
@@ -377,9 +385,20 @@ class MagPotTorchScript(nn.Module):
         e_struct = self.nn_struct(
             torch.cat([desc_struct, embed], dim=-1)
         ).squeeze(-1)
-        e_mag = self.nn_mag(
-            torch.cat([desc_mag, embed], dim=-1)
-        ).squeeze(-1)
+        if self.use_sector_heads:
+            e_mag = torch.zeros(num_atoms, dtype=positions.dtype, device=positions.device)
+            offset = 0
+            for idx, head in enumerate(self.nn_mag_heads):
+                sec_dim = self.mag_sector_dims[idx]
+                desc_sec = desc_mag[:, offset:offset + sec_dim]
+                e_mag = e_mag + head(
+                    torch.cat([desc_sec, embed], dim=-1)
+                ).squeeze(-1)
+                offset += sec_dim
+        else:
+            e_mag = self.nn_mag(
+                torch.cat([desc_mag, embed], dim=-1)
+            ).squeeze(-1)
 
         e_total = e_struct + e_mag + self.atomic_energy_shift[species]
 
@@ -400,28 +419,34 @@ def export_model(checkpoint_path: str, output_path: str, device: str = "cpu"):
         output_path: path for output TorchScript file
         device: device for export ("cpu" recommended)
     """
-    from .model import MagPot
-    from .descriptors import get_struct_descriptor_dim, get_mag_descriptor_dim
+    from .model import MAG_SECTOR_NAMES, MagPot, infer_mag_head_mode_from_state_dict
+    from .descriptors import get_mag_sector_dims, get_struct_descriptor_dim, get_mag_descriptor_dim
 
     dev = torch.device(device)
     ckpt = torch.load(checkpoint_path, map_location=dev, weights_only=False)
 
-    hparams = ckpt["hparams"]
+    hparams = dict(ckpt["hparams"])
+    hparams.setdefault(
+        "mag_head_mode",
+        infer_mag_head_mode_from_state_dict(ckpt["state_dict"]),
+    )
     species_map = ckpt.get("species_map", {})
     magnetic_species = ckpt.get("magnetic_species")
 
     # Reconstruct original model to get weights
     model = MagPot(**hparams)
     model.load_state_dict(ckpt["state_dict"])
+    model.enable_scaler_if_available()
     model.eval()
 
     # Build TorchScript wrapper
-    r_cutoff = hparams["r_cutoff"]
-    basis_size = hparams["basis_size"]
-    n_max = hparams["n_max"]
-    num_species = hparams["num_species"]
+    r_cutoff = float(hparams["r_cutoff"])
+    basis_size = int(hparams["basis_size"])
+    n_max = int(hparams["n_max"])
+    num_species = int(hparams["num_species"])
     struct_dim = get_struct_descriptor_dim(n_max)
     mag_dim = get_mag_descriptor_dim(n_max)
+    mag_sector_dims = [int(x) for x in get_mag_sector_dims(n_max)]
 
     ts_model = MagPotTorchScript(
         r_cutoff=r_cutoff,
@@ -430,6 +455,9 @@ def export_model(checkpoint_path: str, output_path: str, device: str = "cpu"):
         num_species=num_species,
         struct_dim=struct_dim,
         mag_dim=mag_dim,
+        species_embed_dim=model.species_embed_dim,
+        mag_head_mode=model.mag_head_mode,
+        mag_sector_dims=mag_sector_dims,
     )
 
     # Copy weights
@@ -438,7 +466,12 @@ def export_model(checkpoint_path: str, output_path: str, device: str = "cpu"):
         model.species_embedding.state_dict()
     )
     ts_model.nn_struct = model.nn_struct
-    ts_model.nn_mag = model.nn_mag
+    if model.mag_head_mode == "sector":
+        ts_model.nn_mag_heads = nn.ModuleList(
+            [model.nn_mag_heads[name] for name in MAG_SECTOR_NAMES]
+        )
+    else:
+        ts_model.nn_mag = model.nn_mag
 
     # Copy scaler buffers
     ts_model.struct_shift.copy_(model.struct_shift)
@@ -459,6 +492,7 @@ def export_model(checkpoint_path: str, output_path: str, device: str = "cpu"):
         "basis_size": basis_size,
         "n_max": n_max,
         "num_species": num_species,
+        "mag_head_mode": model.mag_head_mode,
         "species_map": species_map,
         "magnetic_species": magnetic_species,
         "project_target_mag_force": True,

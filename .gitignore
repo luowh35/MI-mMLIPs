@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training outputs and checkpoints
+*.pt
+*.out
+predictions.xyz
+energy_train.out
+energy_test.out
+force_train.out
+force_test.out
+heff_train.out
+heff_test.out
+loss.out
+
+# Diagnostic outputs
+spin_scan.dat
+spin_scan.png
+spin_sector_diagnostics*.csv
+spin_sector_diagnostics*.png
+mini_magp_train.png
+mini_magp_test.png
+mini_magp_all.png
+spin_dynamics_cooled_analysis.png
+spin_config.png
+
+# LAMMPS runtime outputs
+log.lammps
+*.btr
+*.dump

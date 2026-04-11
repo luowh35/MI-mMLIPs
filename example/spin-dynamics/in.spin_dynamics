@@ -33,7 +33,7 @@ group           magnetic type 1
 variable        damping1 equal 0.5           # Gilbert damping coefficient
 variable        damping2 equal 0.02
 variable        dt equal 0.001              # Timestep: 1.0 fs = 0.001 ps
-variable        seed equal 12345            # Random seed
+variable        seed equal 2345            # Random seed
 
 # Steps per temperature
 variable        nsteps equal  10000         # Total steps at each temperature
@@ -47,6 +47,8 @@ compute         mag_y magnetic reduce ave c_sp_prop[3]
 compute         mag_z magnetic reduce ave c_sp_prop[4]
 
 set             group magnetic spin/random ${seed} 3
+
+#set             group magnetic spin/atom 3 0 0 1
 # Total magnetization magnitude
 variable        mag_total equal sqrt(c_mag_x^2+c_mag_y^2+c_mag_z^2)
 
@@ -61,7 +63,7 @@ thermo          10
 #dump            spin_dump magnetic custom 10 spin_dynamics.dump id type x y z c_sp_prop[1] c_sp_prop[2] c_sp_prop[3] c_sp_prop[4]
 
 min_style spin/lbfgs
-min_modify line spin_cubic
+min_modify line spin_none discrete_factor 20.0
 minimize 0 1e-6 10000 10000
 
 #fix frlx all box/relax tri 0.0

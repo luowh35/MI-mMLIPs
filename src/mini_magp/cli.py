@@ -11,6 +11,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 import torch
@@ -35,6 +36,7 @@ TRAIN_DEFAULTS = {
     "num_layers": 2,
     "hidden_dim_mag": None,
     "num_layers_mag": None,
+    "mag_head_mode": "sector",
     "lambda_e": 1.0,
     "lambda_f": 10.0,
     "lambda_h": 10.0,
@@ -46,6 +48,7 @@ TRAIN_DEFAULTS = {
     "predict_interval": 10,
     "species_map": None,
     "magnetic_species": None,
+    "resume": None,
 }
 
 
@@ -58,6 +61,93 @@ def _load_config(path: str) -> dict:
     if unknown:
         print(f"Warning: unknown config keys ignored: {unknown}")
     return cfg
+
+
+def _fit_scaler_batched(model, train_ds, batch_size: int):
+    """Fit descriptor scaler without collating the full dataset at once."""
+    from torch.utils.data import DataLoader
+
+    from .data import collate_magnetic
+    from .descriptors import compute_all_descriptors
+    from .utils import build_neighbor_topology, rij_from_topology
+
+    loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_magnetic,
+    )
+
+    struct_sum = torch.zeros(model.struct_dim, dtype=torch.float64)
+    struct_sumsq = torch.zeros(model.struct_dim, dtype=torch.float64)
+    mag_sum = torch.zeros(model.mag_dim, dtype=torch.float64)
+    mag_sumsq = torch.zeros(model.mag_dim, dtype=torch.float64)
+    n_atoms_total = 0
+    compositions = []
+    energies = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_data in loader:
+            positions = batch_data["positions"]
+            species = batch_data["species"]
+            magnetic_moments = batch_data["magnetic_moments"]
+            batch = batch_data.get("batch")
+            cell = batch_data.get("cell")
+            pbc = batch_data.get("pbc")
+
+            edge_index, shifts = build_neighbor_topology(
+                positions, cell, pbc, model.r_cutoff, batch
+            )
+            r_ij = rij_from_topology(positions, edge_index, shifts)
+            i_idx, j_idx = edge_index
+            dist = r_ij.norm(dim=-1)
+            phi = model.radial_basis(dist, species[i_idx], species[j_idx])
+            desc_struct, desc_mag = compute_all_descriptors(
+                edge_index, r_ij, magnetic_moments, phi, positions.shape[0]
+            )
+
+            desc_struct64 = desc_struct.to(torch.float64)
+            desc_mag64 = desc_mag.to(torch.float64)
+            struct_sum += desc_struct64.sum(dim=0)
+            struct_sumsq += desc_struct64.square().sum(dim=0)
+            mag_sum += desc_mag64.sum(dim=0)
+            mag_sumsq += desc_mag64.square().sum(dim=0)
+            n_atoms_total += int(desc_struct.shape[0])
+
+            if "energy" in batch_data:
+                num_structures = int(batch.max().item()) + 1
+                comp = torch.zeros(
+                    num_structures, model.num_species, dtype=torch.float64
+                )
+                for sp in range(model.num_species):
+                    mask_sp = (species == sp).to(torch.float64)
+                    comp[:, sp].scatter_add_(0, batch, mask_sp)
+                compositions.append(comp)
+                energies.append(batch_data["energy"].to(torch.float64))
+
+    if n_atoms_total == 0:
+        raise ValueError("Cannot fit scaler on an empty training dataset.")
+
+    struct_mean = struct_sum / n_atoms_total
+    struct_var = (struct_sumsq / n_atoms_total - struct_mean.square()).clamp(min=1e-12)
+    mag_mean = mag_sum / n_atoms_total
+    mag_var = (mag_sumsq / n_atoms_total - mag_mean.square()).clamp(min=1e-12)
+
+    model.struct_shift.copy_(struct_mean.to(model.struct_shift))
+    model.struct_scale.copy_((1.0 / struct_var.sqrt()).to(model.struct_scale))
+    model.mag_shift.copy_(mag_mean.to(model.mag_shift))
+    model.mag_scale.copy_((1.0 / mag_var.sqrt()).to(model.mag_scale))
+
+    if compositions and energies:
+        A = torch.cat(compositions, dim=0)
+        y = torch.cat(energies, dim=0)
+        result = torch.linalg.lstsq(A, y)
+        model.atomic_energy_shift.copy_(
+            result.solution.to(model.atomic_energy_shift)
+        )
+
+    model._scaler_fitted = True
 
 
 def main():
@@ -83,6 +173,9 @@ def main():
     p_train.add_argument("--num-species", type=int, default=None)
     p_train.add_argument("--hidden-dim", type=int, default=None)
     p_train.add_argument("--num-layers", type=int, default=None)
+    p_train.add_argument("--mag-head-mode", choices=["sector", "monolithic"],
+                         default=None,
+                         help="Magnetic energy head layout (default: sector)")
     p_train.add_argument("--lambda-e", type=float, default=None)
     p_train.add_argument("--lambda-f", type=float, default=None)
     p_train.add_argument("--lambda-h", type=float, default=None)
@@ -113,6 +206,31 @@ def main():
     p_export.add_argument("output", nargs="?", default=None,
                           help="Output TorchScript path (default: model_lammps.pt)")
 
+    # --- test ---
+    p_test = sub.add_parser(
+        "test",
+        help="Run magnetic diagnostic scans and write plots",
+    )
+    p_test.add_argument("model", help="Path to checkpoint .pt file")
+    p_test.add_argument("structure", help="Path to extxyz or LAMMPS spin data file")
+    p_test.add_argument("--index", type=int, default=0,
+                        help="Structure index for extxyz input")
+    p_test.add_argument("--magnetic-element", default="Cr",
+                        help="Magnetic element symbol")
+    p_test.add_argument("--output-dir", default="mini_magp_test",
+                        help="Directory for diagnostic outputs")
+    p_test.add_argument("--format", choices=["auto", "extxyz", "lammps"],
+                        default="auto",
+                        help="Input format for sector diagnostics")
+    p_test.add_argument("--type-map", default=None,
+                        help="LAMMPS type symbols, e.g. 'Cr,I'")
+    p_test.add_argument("--device", default="cpu",
+                        help="Device for sector diagnostics")
+    p_test.add_argument("--skip-spin-scan", action="store_true",
+                        help="Skip spin_scan plot generation")
+    p_test.add_argument("--skip-sector", action="store_true",
+                        help="Skip sector diagnostics plot generation")
+
     # --- default-config ---
     p_cfg = sub.add_parser("default-config",
                            help="Generate a default config JSON file")
@@ -130,6 +248,8 @@ def main():
         _run_predict(args)
     elif args.command == "export":
         _run_export(args)
+    elif args.command == "test":
+        _run_test(args)
     elif args.command == "default-config":
         _run_default_config(args)
 
@@ -160,6 +280,7 @@ def _resolve_train_args(args) -> argparse.Namespace:
         "num_layers": args.num_layers,
         "hidden_dim_mag": getattr(args, "hidden_dim_mag", None),
         "num_layers_mag": getattr(args, "num_layers_mag", None),
+        "mag_head_mode": getattr(args, "mag_head_mode", None),
         "lambda_e": args.lambda_e,
         "lambda_f": args.lambda_f,
         "lambda_h": args.lambda_h,
@@ -169,6 +290,7 @@ def _resolve_train_args(args) -> argparse.Namespace:
         "predict_interval": args.predict_interval,
         "species_map": args.species_map,
         "magnetic_species": args.magnetic_species,
+        "resume": getattr(args, "resume", None),
     }
     for k, v in cli_map.items():
         if v is not None:
@@ -236,6 +358,15 @@ def _run_train(args):
     else:
         print(f"No validation set. Training on all {len(train_ds)} structures.")
 
+    if args.resume:
+        from .model import infer_mag_head_mode_from_state_dict
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if isinstance(resume_ckpt, dict) and "state_dict" in resume_ckpt:
+            args.mag_head_mode = resume_ckpt.get("hparams", {}).get(
+                "mag_head_mode",
+                infer_mag_head_mode_from_state_dict(resume_ckpt["state_dict"]),
+            )
+
     hparams = {
         "r_cutoff": args.r_cutoff,
         "basis_size": args.basis_size,
@@ -245,21 +376,16 @@ def _run_train(args):
         "num_layers": args.num_layers,
         "hidden_dim_mag": args.hidden_dim_mag,
         "num_layers_mag": args.num_layers_mag,
+        "mag_head_mode": args.mag_head_mode,
     }
 
     model = MagPot(**hparams)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Fit descriptor scaler on the full training set.
-    from .data import collate_magnetic
-    scaler_batch = collate_magnetic([train_ds[i] for i in range(len(train_ds))])
-    model.fit_scaler(
-        scaler_batch["positions"], scaler_batch["species"],
-        scaler_batch["magnetic_moments"],
-        cell=scaler_batch.get("cell"), pbc=scaler_batch.get("pbc"),
-        batch=scaler_batch.get("batch"),
-        energies=scaler_batch.get("energy"),
-    )
+    # Fit descriptor scaler without building one huge all-training-set
+    # neighbor graph. This matters for large cutoffs such as r_cutoff=8.
+    print(f"Fitting descriptor scaler in batches of {args.batch_size}...")
+    _fit_scaler_batched(model, train_ds, args.batch_size)
 
     # Create output directory if needed
     os.makedirs(args.output_dir, exist_ok=True)
@@ -298,7 +424,7 @@ def _run_train(args):
 
 
 def _run_predict(args):
-    from .model import MagPot, compute_forces_and_fields
+    from .model import MagPot, compute_forces_and_fields, infer_mag_head_mode_from_state_dict
     from ase.io import read as ase_read, write as ase_write
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -308,10 +434,14 @@ def _run_predict(args):
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
 
     if isinstance(ckpt, dict) and "hparams" in ckpt:
-        hparams = ckpt["hparams"]
+        hparams = dict(ckpt["hparams"])
         species_map = ckpt["species_map"]
         magnetic_species = ckpt.get("magnetic_species")
         state_dict = ckpt["state_dict"]
+        hparams.setdefault(
+            "mag_head_mode",
+            infer_mag_head_mode_from_state_dict(state_dict),
+        )
     else:
         raise ValueError(
             "Checkpoint missing 'hparams'. Was it saved with an older version? "
@@ -320,6 +450,7 @@ def _run_predict(args):
 
     model = MagPot(**hparams)
     model.load_state_dict(state_dict)
+    model.enable_scaler_if_available()
     model.to(device)
     model.eval()
 
@@ -400,6 +531,70 @@ def _run_export(args):
         output = os.path.splitext(args.model)[0] + "_lammps.pt"
 
     export_model(args.model, output)
+
+
+def _run_tool(script_name: str, cmd_args: list[str], cwd: str):
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    script_path = os.path.join(repo_root, "tools", script_name)
+    if not os.path.exists(script_path):
+        raise FileNotFoundError(f"Diagnostic tool not found: {script_path}")
+    cmd = [sys.executable, script_path, *cmd_args]
+    env = dict(os.environ)
+    env.setdefault("MPLCONFIGDIR", os.path.join(cwd, ".matplotlib"))
+    print("$ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=cwd, check=True, env=env)
+
+
+def _run_test(args):
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    model_path = os.path.abspath(args.model)
+    structure_path = os.path.abspath(args.structure)
+
+    print(f"Diagnostic output directory: {output_dir}", flush=True)
+
+    if not args.skip_spin_scan:
+        if args.format == "lammps" or _path_suffix(structure_path) in {".data", ".lmp"}:
+            print("Skipping spin_scan: it currently expects an extxyz structure.")
+        else:
+            _run_tool(
+                "spin_scan.py",
+                [
+                    model_path,
+                    structure_path,
+                    "--index", str(args.index),
+                    "--magnetic-element", args.magnetic_element,
+                ],
+                cwd=output_dir,
+            )
+            print(f"Saved {os.path.join(output_dir, 'spin_scan.dat')}")
+            print(f"Saved {os.path.join(output_dir, 'spin_scan.png')}")
+
+    if not args.skip_sector:
+        sector_csv = os.path.join(output_dir, "spin_sector_diagnostics.csv")
+        sector_png = os.path.join(output_dir, "spin_sector_diagnostics.png")
+        cmd_args = [
+            model_path,
+            structure_path,
+            "--format", args.format,
+            "--index", str(args.index),
+            "--magnetic-element", args.magnetic_element,
+            "--csv", sector_csv,
+            "--plot", sector_png,
+            "--device", args.device,
+        ]
+        if args.type_map:
+            cmd_args += ["--type-map", args.type_map]
+        _run_tool("diagnose_spin_sector_energies.py", cmd_args, cwd=output_dir)
+        print(f"Saved {sector_csv}")
+        print(f"Saved {sector_png}")
+
+    print("mini-magp test complete.")
+
+
+def _path_suffix(path: str) -> str:
+    return os.path.splitext(path)[1].lower()
 
 
 def _run_default_config(args):

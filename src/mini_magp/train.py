@@ -72,6 +72,7 @@ class Trainer:
                 "num_layers": model.num_layers,
                 "hidden_dim_mag": model.hidden_dim_mag,
                 "num_layers_mag": model.num_layers_mag,
+                "mag_head_mode": model.mag_head_mode,
             }
         self.species_map = species_map or {}
         self.magnetic_species = magnetic_species
@@ -417,6 +418,7 @@ class Trainer:
         """Load checkpoint and restore training state. Returns start epoch."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["state_dict"])
+        self.model.enable_scaler_if_available()
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         # Scheduler is recreated in train() and fast-forwarded based on start_epoch
